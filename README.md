@@ -3,6 +3,7 @@ gogextract.py rewrite in Rust with enhancements
 
 - Progress bar
 - File decompression
+- Multithread performance
 
 
 
@@ -10,7 +11,7 @@ gogextract.py rewrite in Rust with enhancements
 
 
 
-# GOG Extract
+# Orginal GOG Extract Script
 
 Script for unpacking GOG Linux installers.
 
