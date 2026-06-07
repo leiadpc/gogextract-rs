@@ -4,8 +4,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::bytes::Regex;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
-use std::num::NonZeroUsize;
+use std::io::{self, BufRead, BufWriter, Cursor, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -74,7 +73,7 @@ struct PackageMetadata {
     script_bytes: Vec<u8>,
 }
 
-// Optimized: Parses metadata entirely out of the shared memory map with zero disk I/O
+// Parses metadata entirely out of the shared memory map with zero disk I/O
 fn parse_metadata(mmap: &[u8]) -> Result<PackageMetadata> {
     let peek_size = std::cmp::min(HEADER_PEEK_SIZE, mmap.len());
     let peek_slice = &mmap[..peek_size];
@@ -103,14 +102,16 @@ fn parse_metadata(mmap: &[u8]) -> Result<PackageMetadata> {
     )?
     .parse()?;
 
-    // Read the script lines straight out of memory
-    let mut reader = BufReader::new(mmap);
+    // Read the script lines straight out of memory via Cursor — no heap buffer needed
+    // since the data is already in memory via mmap. BufReader would add a pointless
+    // heap-allocated staging buffer on top of data that's already random-access.
+    let mut cursor = Cursor::new(mmap);
     let mut script_bytes: Vec<u8> = Vec::new();
     let mut line = Vec::new();
 
     for _ in 0..script_line_count {
         line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        if cursor.read_until(b'\n', &mut line)? == 0 {
             break;
         }
         script_bytes.extend_from_slice(&line);
@@ -194,7 +195,7 @@ fn run() -> Result<bool> {
     let script_size = meta.script_size as usize;
     let mojosetup_size = meta.mojosetup_size as usize;
 
-    // ENCHANTMENT 2: Drop the metadata to free up RAM immediately
+    // Drop the metadata to free up RAM immediately
     drop(meta);
 
     println!("Starting extraction. Press Ctrl+C to cancel...\n");
@@ -243,74 +244,73 @@ fn run() -> Result<bool> {
         pb_data.set_length(total_files as u64);
         let game_dir = out_dir.join("game_data");
 
-        // ENCHANTMENT 3: Parallelizing the load using Rayon chunks
-        let cores = thread::available_parallelism()
-            .unwrap_or(NonZeroUsize::new(4).unwrap())
-            .get();
-        let indices: Vec<usize> = (0..total_files).collect();
-        let chunk_size = (total_files.max(1) + cores - 1) / cores;
+        // Rayon's work-stealing scheduler distributes entries automatically, handling
+        // uneven file sizes far better than manual static chunks. Each worker picks
+        // up the next available index when it finishes, so a thread stuck on a large
+        // file doesn't block others.
+        (0..total_files)
+            .into_par_iter()
+            .try_for_each(|i| -> Result<()> {
+                if !run2.load(Ordering::Relaxed) {
+                    anyhow::bail!("Cancelled");
+                }
 
-        indices
-            .par_chunks(chunk_size)
-            .try_for_each(|chunk| -> Result<()> {
-                // Each Rayon thread gets its own lightweight ZipArchive parsing from shared memory
+                // Each Rayon worker opens its own ZipArchive view into shared memory.
+                // Construction only reads the central directory, so it's cheap, and
+                // doing it here (rather than once per static chunk) lets Rayon
+                // work-steal freely without any per-chunk archive lifetime issues.
                 let cursor = Cursor::new(mmap_data.clone());
                 let mut local_archive = zip::ZipArchive::new(cursor)?;
 
-                for &i in chunk {
-                    if !run2.load(Ordering::Relaxed) {
-                        anyhow::bail!("Cancelled");
+                let mut zip_file = local_archive.by_index(i)?;
+                let Some(path) = zip_file.enclosed_name() else {
+                    return Ok(());
+                };
+                let outpath = game_dir.join(&path);
+
+                // Update the progress bar text occasionally to avoid high lock contention
+                if i % 25 == 0 {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        pb_data.set_message(name.to_owned());
                     }
-
-                    let mut zip_file = local_archive.by_index(i)?;
-                    let Some(path) = zip_file.enclosed_name() else {
-                        continue;
-                    };
-                    let outpath = game_dir.join(&path);
-
-                    // Update the progress bar text occasionally to avoid high lock contention
-                    if i % 25 == 0 {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            pb_data.set_message(name.to_owned());
-                        }
-                    }
-
-                    if zip_file.name().ends_with('/') {
-                        fs::create_dir_all(&outpath)?;
-                    } else {
-                        if let Some(p) = outpath.parent() {
-                            fs::create_dir_all(p)?;
-                        }
-
-                        let outfile = File::create(&outpath)?;
-
-                        // ENCHANTMENT 1: Pre-allocate disk space to prevent fragmentation
-                        outfile.set_len(zip_file.size())?;
-
-                        let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, outfile);
-                        let mut safe_reader = CancellableReader {
-                            inner: &mut zip_file,
-                            running: &run2,
-                        };
-                        let mut buffer = [0u8; COPY_BUFFER_SIZE];
-
-                        loop {
-                            let bytes_read = safe_reader.read(&mut buffer)?;
-                            if bytes_read == 0 {
-                                break;
-                            }
-                            writer.write_all(&buffer[..bytes_read])?;
-                        }
-                        writer.flush()?;
-
-                        #[cfg(unix)]
-                        if let Some(mode) = zip_file.unix_mode() {
-                            fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
-                        }
-                    }
-                    // Indicatif handles parallel increments safely
-                    pb_data.inc(1);
                 }
+
+                if zip_file.name().ends_with('/') {
+                    fs::create_dir_all(&outpath)?;
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        fs::create_dir_all(p)?;
+                    }
+
+                    let outfile = File::create(&outpath)?;
+
+                    // Pre-allocate disk space to prevent fragmentation
+                    outfile.set_len(zip_file.size())?;
+
+                    let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, outfile);
+                    let mut safe_reader = CancellableReader {
+                        inner: &mut zip_file,
+                        running: &run2,
+                    };
+                    let mut buffer = [0u8; COPY_BUFFER_SIZE];
+
+                    loop {
+                        let bytes_read = safe_reader.read(&mut buffer)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        writer.write_all(&buffer[..bytes_read])?;
+                    }
+                    writer.flush()?;
+
+                    #[cfg(unix)]
+                    if let Some(mode) = zip_file.unix_mode() {
+                        fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
+                    }
+                }
+
+                // Indicatif handles parallel increments safely
+                pb_data.inc(1);
                 Ok(())
             })?;
 
