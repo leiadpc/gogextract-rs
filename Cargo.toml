@@ -5,15 +5,12 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.4", features = ["derive"] }
-indicatif = "0.17"
-regex = "1.10"
-flate2 = "1.0"
-tar = "0.4"
-zip = "0.6"
+clap = { version = "4.0", features = ["derive"] }
 ctrlc = "3.4"
+indicatif = "0.17"
 memmap2 = "0.9"
-rayon = "1.8"
+rayon = "1.10"
+zip = "2.0"
 
 [profile.release]
 opt-level = 3
