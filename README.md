@@ -4,7 +4,11 @@ gogextract.py rewrite in Rust with enhancements
 - Progress bar
 - File decompression
 - Multithread performance
+<br>
+A few notable differences in operation
 
+- Only extracts\decompresses game data not the the install script or mojosetup files
+- Extracts into a temp folder first then moves into a folder named after the installer
 
 
 
