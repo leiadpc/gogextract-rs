@@ -2,38 +2,46 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use regex::bytes::Regex;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufWriter, Cursor, Read, Write};
+use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-const HEADER_PEEK_SIZE: usize = 10 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
-// Minimum time between progress bar message updates, to avoid thrashing under
-// Rayon's work-stealing scheduler where index-based throttling is unreliable.
+// How many bytes to decompress between cancellation polls.
+const CANCEL_CHECK_INTERVAL_BYTES: usize = 1024 * 1024; // 1 MB
+
+// Minimum wall-clock time between progress-bar filename updates.
 const PROGRESS_MSG_INTERVAL: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
-// Lazily-compiled regexes
+// Cancellation error sentinel
+//
+// We need to distinguish "user pressed Ctrl-C" from a genuine I/O error so
+// that run() can return Ok(false) for the clean cancellation path instead of
+// propagating an Err and printing "❌ Extraction failed".
 // ---------------------------------------------------------------------------
 
-static OFFSET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"offset=`head -n (\d+?) "\$0""#).unwrap());
+#[derive(Debug)]
+struct Cancelled;
 
-static FILESIZE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"filesizes="(\d+?)""#).unwrap());
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cancelled by user")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 // ---------------------------------------------------------------------------
-// Thread-Safe Shared Memory-Map Wrapper
+// Thread-safe shared memory-map wrapper
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -41,28 +49,61 @@ struct ArcMmap(Arc<memmap2::Mmap>);
 
 impl AsRef<[u8]> for ArcMmap {
     fn as_ref(&self) -> &[u8] {
-        &self.0[..]
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ArcMmap {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
     }
 }
 
 // ---------------------------------------------------------------------------
-// CancellableReader
+// Cancellable, buffered reader
+//
+// Wraps any Read and polls `running` every CANCEL_CHECK_INTERVAL_BYTES bytes.
+// Using a fixed read buffer of COPY_BUFFER_SIZE means callers (io::copy) get
+// large reads regardless of the inner reader's default chunk size.
 // ---------------------------------------------------------------------------
 
 struct CancellableReader<'a, R> {
     inner: R,
     running: &'a Arc<AtomicBool>,
+    bytes_since_check: usize,
+    buf: Box<[u8; COPY_BUFFER_SIZE]>,
+}
+
+impl<'a, R: Read> CancellableReader<'a, R> {
+    fn new(inner: R, running: &'a Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            running,
+            bytes_since_check: 0,
+            buf: Box::new([0u8; COPY_BUFFER_SIZE]),
+        }
+    }
 }
 
 impl<'a, R: Read> Read for CancellableReader<'a, R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.running.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "Cancelled by user",
-            ));
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        // Poll cancellation flag before each chunk.
+        if self.bytes_since_check >= CANCEL_CHECK_INTERVAL_BYTES {
+            if !self.running.load(Ordering::Relaxed) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            self.bytes_since_check = 0;
         }
-        self.inner.read(buf)
+
+        // Read into our own buffer to control the chunk size, then copy to
+        // `out`.  This ensures io::copy gets COPY_BUFFER_SIZE-sized reads
+        // even though ZipFile's own Read impl uses small internal chunks.
+        let want = out.len().min(COPY_BUFFER_SIZE);
+        let n = self.inner.read(&mut self.buf[..want])?;
+        out[..n].copy_from_slice(&self.buf[..n]);
+        self.bytes_since_check += n;
+        Ok(n)
     }
 }
 
@@ -71,11 +112,18 @@ impl<'a, R: Read> Read for CancellableReader<'a, R> {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about)]
 struct Args {
     input_file: PathBuf,
-    #[arg(default_value = "./")]
-    output_dir: PathBuf,
+    /// Optional custom output directory.  If omitted, a folder named after the
+    /// input file (without extension) is created in the current directory.
+    output_dir: Option<PathBuf>,
+    /// Overwrite existing output files if they already exist.
+    #[arg(long, short)]
+    force: bool,
+    /// List archive contents without extracting anything.
+    #[arg(long, short)]
+    list: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,15 +131,13 @@ struct Args {
 // ---------------------------------------------------------------------------
 
 struct OutputLayout {
-    final_unpacker_path: PathBuf,
-    final_mojosetup_dir: PathBuf,
     final_game_dir: PathBuf,
     staging_dir: PathBuf,
-    staging_unpacker_path: PathBuf,
-    staging_mojosetup_dir: PathBuf,
     staging_game_dir: PathBuf,
+    backup_game_dir: Option<PathBuf>,
 }
 
+/// RAII guard that removes the staging directory on drop unless disarmed.
 struct StagingCleanup {
     staging_dir: PathBuf,
     armed: bool,
@@ -115,7 +161,7 @@ impl Drop for StagingCleanup {
         if self.armed {
             if let Err(e) = fs::remove_dir_all(&self.staging_dir) {
                 eprintln!(
-                    "Warning: Failed to clean up staging directory {}: {}",
+                    "Warning: failed to clean up staging directory {}: {}",
                     self.staging_dir.display(),
                     e
                 );
@@ -124,40 +170,33 @@ impl Drop for StagingCleanup {
     }
 }
 
-fn prepare_output_layout(output_dir: &Path) -> Result<OutputLayout> {
+fn prepare_output_layout(output_dir: &Path, force: bool) -> Result<OutputLayout> {
     fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
 
-    let final_unpacker_path = output_dir.join("unpacker.sh");
-    let final_mojosetup_dir = output_dir.join("mojosetup");
     let final_game_dir = output_dir.join("game_data");
-
-    ensure_output_paths_available(&[&final_unpacker_path, &final_mojosetup_dir, &final_game_dir])?;
+    ensure_output_path_available(&final_game_dir, force)?;
 
     let staging_dir = create_staging_dir(output_dir)?;
-    let staging_unpacker_path = staging_dir.join("unpacker.sh");
-    let staging_mojosetup_dir = staging_dir.join("mojosetup");
     let staging_game_dir = staging_dir.join("game_data");
+    let backup_game_dir = force
+        .then(|| staging_dir.join("previous-game_data"))
+        .filter(|_| final_game_dir.exists());
 
     Ok(OutputLayout {
-        final_unpacker_path,
-        final_mojosetup_dir,
         final_game_dir,
         staging_dir,
-        staging_unpacker_path,
-        staging_mojosetup_dir,
         staging_game_dir,
+        backup_game_dir,
     })
 }
 
-fn ensure_output_paths_available(paths: &[&Path]) -> Result<()> {
-    for path in paths {
-        if path.exists() {
-            anyhow::bail!(
-                "Output path already exists: {}. Choose an empty output directory or remove it first.",
-                path.display()
-            );
-        }
+fn ensure_output_path_available(path: &Path, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        anyhow::bail!(
+            "Output path already exists: {}. Use --force to overwrite.",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -175,7 +214,6 @@ fn create_staging_dir(output_dir: &Path) -> Result<PathBuf> {
             timestamp,
             attempt
         ));
-
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -186,7 +224,6 @@ fn create_staging_dir(output_dir: &Path) -> Result<PathBuf> {
             }
         }
     }
-
     anyhow::bail!(
         "Failed to create a unique staging directory under {}",
         output_dir.display()
@@ -194,124 +231,131 @@ fn create_staging_dir(output_dir: &Path) -> Result<PathBuf> {
 }
 
 fn finalize_output(layout: &OutputLayout) -> Result<()> {
-    // Drop the pre-extraction check here: the paths were verified in
-    // prepare_output_layout and re-checking right before rename gives false
-    // safety (TOCTOU) without preventing a race. Let fs::rename surface any
-    // conflict naturally via its own error.
-    fs::rename(&layout.staging_unpacker_path, &layout.final_unpacker_path).with_context(|| {
-        format!(
-            "Failed to move {} into place",
-            layout.final_unpacker_path.display()
-        )
-    })?;
-    fs::rename(&layout.staging_mojosetup_dir, &layout.final_mojosetup_dir).with_context(|| {
-        format!(
-            "Failed to move {} into place",
-            layout.final_mojosetup_dir.display()
-        )
-    })?;
-    fs::rename(&layout.staging_game_dir, &layout.final_game_dir).with_context(|| {
-        format!(
-            "Failed to move {} into place",
-            layout.final_game_dir.display()
-        )
-    })?;
+    if let Some(backup_game_dir) = &layout.backup_game_dir {
+        fs::rename(&layout.final_game_dir, backup_game_dir).with_context(|| {
+            format!(
+                "Failed to move existing {} out of the way",
+                layout.final_game_dir.display()
+            )
+        })?;
+    }
+
+    if let Err(e) = fs::rename(&layout.staging_game_dir, &layout.final_game_dir) {
+        if let Some(backup_game_dir) = &layout.backup_game_dir {
+            fs::rename(backup_game_dir, &layout.final_game_dir).with_context(|| {
+                format!(
+                    "Failed to restore previous output {} after replacement failed",
+                    layout.final_game_dir.display()
+                )
+            })?;
+        }
+
+        return Err(e).with_context(|| {
+            format!(
+                "Failed to move {} into place",
+                layout.final_game_dir.display()
+            )
+        });
+    }
+
+    if let Some(backup_game_dir) = &layout.backup_game_dir {
+        remove_existing_output_path(backup_game_dir).with_context(|| {
+            format!(
+                "Failed to remove previous output {}",
+                backup_game_dir.display()
+            )
+        })?;
+    }
+
     fs::remove_dir(&layout.staging_dir).with_context(|| {
         format!(
             "Failed to remove staging directory {}",
             layout.staging_dir.display()
         )
     })?;
-
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Metadata parsing
-// ---------------------------------------------------------------------------
-
-struct PackageMetadata {
-    script_size: u64,
-    mojosetup_size: u64,
-    script_bytes: Vec<u8>,
-}
-
-fn parse_metadata(mmap: &[u8]) -> Result<PackageMetadata> {
-    let peek_size = std::cmp::min(HEADER_PEEK_SIZE, mmap.len());
-    let peek_slice = &mmap[..peek_size];
-
-    // Use lazily-compiled statics instead of compiling on every call.
-    let offset_caps = OFFSET_RE
-        .captures(peek_slice)
-        .context("Could not find 'offset' metadata")?;
-    let script_line_count: u64 = std::str::from_utf8(
-        offset_caps
-            .get(1)
-            .context("Missing capture group in offset")?
-            .as_bytes(),
-    )?
-    .parse()?;
-
-    let filesize_caps = FILESIZE_RE
-        .captures(peek_slice)
-        .context("Could not find 'filesizes' metadata")?;
-    let mojosetup_size: u64 = std::str::from_utf8(
-        filesize_caps
-            .get(1)
-            .context("Missing capture group in filesize")?
-            .as_bytes(),
-    )?
-    .parse()?;
-
-    let mut cursor = Cursor::new(mmap);
-    let mut script_bytes: Vec<u8> = Vec::new();
-    let mut line = Vec::new();
-
-    for line_number in 0..script_line_count {
-        line.clear();
-        if cursor.read_until(b'\n', &mut line)? == 0 {
-            anyhow::bail!(
-                "Installer script ended early: expected {} lines, found {}",
-                script_line_count,
-                line_number
-            );
-        }
-        script_bytes.extend_from_slice(&line);
+fn remove_existing_output_path(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
     }
-
-    // Use try_from consistently with the rest of the codebase rather than
-    // a silent `as u64` cast.
-    let script_size = u64::try_from(script_bytes.len()).context("Script size overflows u64")?;
-
-    Ok(PackageMetadata {
-        script_size,
-        mojosetup_size,
-        script_bytes,
-    })
 }
 
 // ---------------------------------------------------------------------------
 // Progress bar helpers
 // ---------------------------------------------------------------------------
 
-fn bytes_style(prefix: &str) -> ProgressStyle {
-    ProgressStyle::with_template(&format!(
-        "{{spinner:.cyan}} {prefix} [{{bar:40.green/dim}}] {{bytes}}/{{total_bytes}} ({{eta}}) {{msg}}"
-    ))
+fn file_count_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.magenta.bold} Files    [{bar:40.magenta/purple.dim}] {pos}/{len}  {msg:.dim}",
+    )
     .unwrap()
-    .progress_chars("█▉▊▋▌▍▎▏ ")
+    .progress_chars("█▇▆▅▄▃▂ ")
 }
 
-fn count_style(prefix: &str) -> ProgressStyle {
-    ProgressStyle::with_template(&format!(
-        "{{spinner:.cyan}} {prefix} [{{bar:40.blue/dim}}] {{pos}}/{{len}} files  {{msg:.dim}}"
-    ))
+fn byte_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.cyan.bold}   Bytes   [{bar:40.cyan/blue.dim}] {bytes}/{total_bytes}  ({bytes_per_sec})",
+    )
     .unwrap()
-    .progress_chars("█▉▊▋▌▍▎▏ ")
+    .progress_chars("█▇▆▅▄▃▂ ")
 }
 
 // ---------------------------------------------------------------------------
-// Main & Execution
+// --list implementation
+// ---------------------------------------------------------------------------
+
+fn list_archive(mmap: &ArcMmap) -> Result<()> {
+    let cursor = Cursor::new(mmap.clone());
+    let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
+
+    println!("{:<10}  {:<19}  {}", "Size", "Modified", "Name");
+    println!("{}", "-".repeat(72));
+
+    let mut total_size: u64 = 0;
+    let mut file_count: usize = 0;
+
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .with_context(|| format!("Failed to read ZIP entry #{i}"))?;
+
+        let name = entry.name();
+        let size = entry.size();
+
+        // Format the last-modified time if available.
+        let modified = match entry.last_modified() {
+            Some(dt) => format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                dt.year(),
+                dt.month(),
+                dt.day(),
+                dt.hour(),
+                dt.minute(),
+                dt.second(),
+            ),
+            None => "unknown            ".to_owned(),
+        };
+
+        println!("{:<10}  {}  {}", size, modified, name);
+
+        if !entry.is_dir() {
+            total_size += size;
+            file_count += 1;
+        }
+    }
+
+    println!("{}", "-".repeat(72));
+    println!("{file_count} file(s), {total_size} bytes uncompressed");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Main & execution
 // ---------------------------------------------------------------------------
 
 fn main() {
@@ -320,11 +364,12 @@ fn main() {
             println!("\n🎉 Extraction complete!");
         }
         Ok(false) => {
-            println!("\n🚨 Cancelled! Cleaned up.");
+            println!("\n🚨 Cancelled — cleaned up.");
             std::process::exit(130);
         }
         Err(e) => {
-            eprintln!("\n❌ Extraction failed: {:?}", e);
+            // Surface the root cause clearly; skip the top-level anyhow chain.
+            eprintln!("\n❌ Extraction failed: {e:#}");
             std::process::exit(1);
         }
     }
@@ -333,261 +378,230 @@ fn main() {
 fn run() -> Result<bool> {
     let args = Args::parse();
 
-    // `running` is set to false on user cancel only. Threads must NOT set it
-    // false on error — that conflates errors with cancellation and causes the
-    // wrong exit path to be taken.
-    let running = Arc::new(AtomicBool::new(true));
-    let user_cancelled = Arc::new(AtomicBool::new(false));
-
-    let r = running.clone();
-    let c = user_cancelled.clone();
-    ctrlc::set_handler(move || {
-        c.store(true, Ordering::SeqCst);
-        r.store(false, Ordering::SeqCst);
-    })?;
+    // --- Open and memory-map the input file ---
 
     let file = File::open(&args.input_file)
-        .with_context(|| format!("Failed to open input file {}", args.input_file.display()))?;
+        .with_context(|| format!("Failed to open {}", args.input_file.display()))?;
 
-    if cfg!(target_pointer_width = "32") && file.metadata()?.len() > (u32::MAX as u64) {
-        anyhow::bail!("File is too large to memory map on a 32-bit architecture.");
+    if cfg!(target_pointer_width = "32") && file.metadata()?.len() > u32::MAX as u64 {
+        anyhow::bail!("File is too large to memory-map on a 32-bit architecture.");
     }
 
     let raw_mmap = unsafe { memmap2::Mmap::map(&file).context("Failed to memory-map input file")? };
     let mmap = ArcMmap(Arc::new(raw_mmap));
 
-    let meta = parse_metadata(mmap.as_ref())?;
-    let layout = prepare_output_layout(&args.output_dir)?;
+    // --- --list: just enumerate and exit ---
+
+    if args.list {
+        return list_archive(&mmap).map(|()| true);
+    }
+
+    // --- Set up Ctrl-C handler ---
+
+    let running = Arc::new(AtomicBool::new(true));
+    let user_cancelled = Arc::new(AtomicBool::new(false));
+
+    {
+        let running = running.clone();
+        let user_cancelled = user_cancelled.clone();
+        ctrlc::set_handler(move || {
+            user_cancelled.store(true, Ordering::SeqCst);
+            running.store(false, Ordering::SeqCst);
+        })?;
+    }
+
+    // --- Resolve output directory ---
+
+    let resolved_output_dir = args.output_dir.unwrap_or_else(|| {
+        let mut dir = PathBuf::from("./");
+        dir.push(
+            args.input_file
+                .file_stem()
+                .unwrap_or_else(|| std::ffi::OsStr::new("extracted_game_data")),
+        );
+        dir
+    });
+
+    // --- Count files and total uncompressed bytes for progress bars ---
+
+    let (total_files, total_bytes) = {
+        let cursor = Cursor::new(mmap.clone());
+        let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
+        let count = archive.len();
+        let mut bytes: u64 = 0;
+        for i in 0..count {
+            if let Ok(entry) = archive.by_index(i) {
+                if !entry.is_dir() {
+                    bytes += entry.size();
+                }
+            }
+        }
+        (count, bytes)
+    };
+
+    // --- Prepare staging layout ---
+
+    let layout = prepare_output_layout(&resolved_output_dir, args.force)?;
     let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
 
-    fs::write(&layout.staging_unpacker_path, &meta.script_bytes).with_context(|| {
+    println!("Extracting to: {}\n", resolved_output_dir.display());
+    println!("Press Ctrl+C to cancel.\n");
+
+    fs::create_dir_all(&layout.staging_game_dir).with_context(|| {
         format!(
-            "Failed to write unpacker script {}",
-            layout.staging_unpacker_path.display()
+            "Failed to create staging game-data directory {}",
+            layout.staging_game_dir.display()
         )
     })?;
 
-    #[cfg(unix)]
-    fs::set_permissions(
-        &layout.staging_unpacker_path,
-        fs::Permissions::from_mode(0o755),
-    )
-    .with_context(|| {
-        format!(
-            "Failed to mark unpacker script executable {}",
-            layout.staging_unpacker_path.display()
-        )
-    })?;
+    // --- Progress bars (two bars: file count + bytes) ---
 
-    let script_size = usize::try_from(meta.script_size)
-        .context("Installer script size does not fit in memory address space")?;
-    let mojosetup_size = usize::try_from(meta.mojosetup_size)
-        .context("MojoSetup size does not fit in memory address space")?;
+    let multi = MultiProgress::new();
 
-    drop(meta);
+    let pb_files = multi.add(ProgressBar::new(total_files as u64));
+    pb_files.set_style(file_count_style());
 
-    println!("Starting extraction. Press Ctrl+C to cancel...\n");
-    let m = MultiProgress::new();
+    let pb_bytes = multi.add(ProgressBar::new(total_bytes));
+    pb_bytes.set_style(byte_progress_style());
 
-    // --- Thread 1: MojoSetup (Shared Memmap - Sequential Extraction) ---
-    let (mmap_setup, setup_dir, run1) = (
-        mmap.clone(),
-        layout.staging_mojosetup_dir.clone(),
-        running.clone(),
+    // Shared state for the throttled filename display.
+    let extraction_start = Instant::now();
+    let last_msg_nanos = Arc::new(AtomicU64::new(0));
+    let bytes_extracted = Arc::new(AtomicU64::new(0));
+
+    // --- Parallel extraction ---
+
+    let extract_result = (0..total_files).into_par_iter().try_for_each_init(
+        || {
+            let cursor = Cursor::new(mmap.clone());
+            zip::ZipArchive::new(cursor).context("Failed to open ZIP archive for worker")
+        },
+        |local_archive, i| -> Result<()> {
+            // Fast cancellation check before opening the entry.
+            if !running.load(Ordering::Relaxed) {
+                // Return the sentinel error type so run() can distinguish
+                // cancellation from a genuine extraction failure.
+                return Err(anyhow::anyhow!(Cancelled));
+            }
+
+            let local_archive = local_archive
+                .as_mut()
+                .map_err(|e| anyhow::anyhow!("ZIP archive init failed for worker: {e:#}"))?;
+
+            let mut zip_file = local_archive
+                .by_index(i)
+                .with_context(|| format!("Failed to read ZIP entry #{i}"))?;
+
+            let entry_name = zip_file.name().to_owned();
+            let Some(path) = zip_file.enclosed_name() else {
+                eprintln!("Warning: skipping unsafe path in ZIP: {entry_name:?}");
+                pb_files.inc(1);
+                return Ok(());
+            };
+            let outpath = layout.staging_game_dir.join(&path);
+
+            // Throttled filename update: use wall-clock nanos to avoid
+            // compare_exchange spuriously losing under contention.
+            let now_ns = extraction_start.elapsed().as_nanos() as u64;
+            let interval_ns = PROGRESS_MSG_INTERVAL.as_nanos() as u64;
+            let last_ns = last_msg_nanos.load(Ordering::Relaxed);
+            if now_ns.saturating_sub(last_ns) >= interval_ns
+                && last_msg_nanos
+                    .compare_exchange(last_ns, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    pb_files.set_message(name.to_owned());
+                }
+            }
+
+            if zip_file.is_dir() {
+                fs::create_dir_all(&outpath)
+                    .with_context(|| format!("Failed to create directory {}", outpath.display()))?;
+            } else {
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("Failed to create parent directory {}", parent.display())
+                    })?;
+                }
+
+                let outfile = File::create(&outpath)
+                    .with_context(|| format!("Failed to create {}", outpath.display()))?;
+
+                let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, outfile);
+                let mut reader = CancellableReader::new(&mut zip_file, &running);
+
+                let written = io::copy(&mut reader, &mut writer)
+                    .with_context(|| format!("Failed to write {entry_name}"))?;
+
+                writer
+                    .flush()
+                    .with_context(|| format!("Failed to flush {}", outpath.display()))?;
+
+                #[cfg(unix)]
+                if let Some(mode) = zip_file.unix_mode() {
+                    fs::set_permissions(&outpath, fs::Permissions::from_mode(mode)).with_context(
+                        || format!("Failed to set permissions on {}", outpath.display()),
+                    )?;
+                }
+
+                // Update byte-level progress atomically.
+                bytes_extracted.fetch_add(written, Ordering::Relaxed);
+                pb_bytes.set_position(bytes_extracted.load(Ordering::Relaxed));
+            }
+
+            pb_files.inc(1);
+            Ok(())
+        },
     );
 
-    let pb_setup = m.add(ProgressBar::new(mojosetup_size as u64));
-    pb_setup.set_style(bytes_style("MojoSetup "));
+    // --- Resolve extraction outcome ---
+    //
+    // Three cases:
+    //   1. Ok(())            — completed normally
+    //   2. Err(Cancelled)    — user pressed Ctrl-C (clean path)
+    //   3. Err(other)        — genuine failure
 
-    let handle_setup = thread::spawn(move || -> Result<()> {
-        let end = script_size
-            .checked_add(mojosetup_size)
-            .context("MojoSetup metadata sizes overflowed")?;
-        if end > mmap_setup.0.len() {
-            anyhow::bail!("MojoSetup metadata sizes exceed total package size");
+    match extract_result {
+        Ok(()) => {}
+        Err(e)
+            if e.downcast_ref::<Cancelled>().is_some()
+                || user_cancelled.load(Ordering::Relaxed) =>
+        {
+            pb_files.abandon_with_message("cancelled");
+            pb_bytes.abandon_with_message("cancelled");
+            // staging_cleanup still armed — will remove the partial output on drop
+            return Ok(false);
         }
+        Err(e) => return Err(e),
+    }
 
-        fs::create_dir_all(&setup_dir).with_context(|| {
-            format!(
-                "Failed to create MojoSetup output directory {}",
-                setup_dir.display()
-            )
-        })?;
-
-        let compressed_slice = &mmap_setup.0[script_size..end];
-        let reader = pb_setup.wrap_read(compressed_slice);
-        let safe_reader = CancellableReader {
-            inner: reader,
-            running: &run1,
-        };
-
-        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(safe_reader));
-        archive
-            .unpack(&setup_dir)
-            .with_context(|| format!("Failed to unpack MojoSetup into {}", setup_dir.display()))?;
-        pb_setup.finish_with_message("✅ done");
-        Ok(())
-        // No longer calling run1.store(false) on error — that is the Ctrl+C
-        // handler's job. Errors propagate through the join handle instead.
-    });
-
-    // --- Thread 2: Game Data (Rayon Parallel Extraction) ---
-    let (mmap_data, game_dir, run2) = (
-        mmap.clone(),
-        layout.staging_game_dir.clone(),
-        running.clone(),
-    );
-
-    let pb_data = m.add(ProgressBar::new(0));
-    pb_data.set_style(count_style("Game Data "));
-
-    let handle_data = thread::spawn(move || -> Result<()> {
-        // Open the archive once to read total_files; reuse the same parse
-        // rather than opening a second ZipArchive just for the count.
-        let cursor = Cursor::new(mmap_data.clone());
-        let archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
-        let total_files = archive.len();
-        drop(archive);
-
-        pb_data.set_length(total_files as u64);
-        fs::create_dir_all(&game_dir).with_context(|| {
-            format!(
-                "Failed to create game data output directory {}",
-                game_dir.display()
-            )
-        })?;
-
-        // Shared timestamp for time-based progress message throttling.
-        // Rayon's work-stealing means index % N updates are uneven;
-        // a wall-clock gate keeps the display responsive without thrashing.
-        let last_msg_time = Arc::new(AtomicU64::new(0));
-
-        (0..total_files).into_par_iter().try_for_each_init(
-            || {
-                let cursor = Cursor::new(mmap_data.clone());
-                zip::ZipArchive::new(cursor).context("Failed to open ZIP archive for worker")
-            },
-            |local_archive, i| -> Result<()> {
-                if !run2.load(Ordering::Relaxed) {
-                    anyhow::bail!("Cancelled");
-                }
-
-                let local_archive = match local_archive {
-                    Ok(archive) => archive,
-                    Err(e) => anyhow::bail!("Failed to open ZIP archive for worker: {e:#}"),
-                };
-
-                let mut zip_file = local_archive
-                    .by_index(i)
-                    .with_context(|| format!("Failed to read ZIP entry #{i}"))?;
-
-                let entry_name = zip_file.name().to_owned();
-                let Some(path) = zip_file.enclosed_name() else {
-                    pb_data.inc(1);
-                    return Ok(());
-                };
-                let outpath = game_dir.join(&path);
-
-                // Time-based throttle: update the message at most every
-                // PROGRESS_MSG_INTERVAL regardless of which Rayon thread fires.
-                let now_ms = Instant::now().elapsed().as_millis() as u64;
-                let interval_ms = PROGRESS_MSG_INTERVAL.as_millis() as u64;
-                let last = last_msg_time.load(Ordering::Relaxed);
-                if now_ms.saturating_sub(last) >= interval_ms {
-                    if last_msg_time
-                        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            pb_data.set_message(name.to_owned());
-                        }
-                    }
-                }
-
-                // Robust platform-agnostic check using the zip library directly
-                if zip_file.is_dir() {
-                    fs::create_dir_all(&outpath).with_context(|| {
-                        format!("Failed to create directory {}", outpath.display())
-                    })?;
-                } else {
-                    if let Some(p) = outpath.parent() {
-                        fs::create_dir_all(p).with_context(|| {
-                            format!("Failed to create parent directory {}", p.display())
-                        })?;
-                    }
-
-                    let outfile = File::create(&outpath).with_context(|| {
-                        format!("Failed to create output file {}", outpath.display())
-                    })?;
-
-                    outfile.set_len(zip_file.size()).with_context(|| {
-                        format!("Failed to pre-allocate output file {}", outpath.display())
-                    })?;
-
-                    let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, outfile);
-                    let mut safe_reader = CancellableReader {
-                        inner: &mut zip_file,
-                        running: &run2,
-                    };
-
-                    // Highly optimized internal copy leverages OS mechanics when possible
-                    // and handles standard read/write byte boundaries much better.
-                    io::copy(&mut safe_reader, &mut writer).with_context(|| {
-                        format!("Failed to copy data for ZIP entry {entry_name}")
-                    })?;
-
-                    writer.flush().with_context(|| {
-                        format!("Failed to flush output file {}", outpath.display())
-                    })?;
-
-                    #[cfg(unix)]
-                    if let Some(mode) = zip_file.unix_mode() {
-                        fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))
-                            .with_context(|| {
-                                format!("Failed to set permissions on {}", outpath.display())
-                            })?;
-                    }
-                }
-
-                pb_data.inc(1);
-                Ok(())
-                // Errors propagate through try_for_each; no run2.store(false)
-                // here — that is solely the Ctrl+C handler's responsibility.
-            },
-        )?;
-
-        pb_data.finish_with_message("✅ done");
-        Ok(())
-        // Same as Thread 1: no run2.store(false) on error at the outer level.
-    });
-
-    let setup_result = handle_setup
-        .join()
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("MojoSetup thread panicked")));
-    let data_result = handle_data
-        .join()
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("Game data thread panicked")));
-
-    // Only treat as a clean cancel if the user actually hit Ctrl+C.
-    // If threads failed for other reasons, fall through to the error match
-    // so the real error message is surfaced rather than a misleading "Cancelled".
+    // Double-check: if the Ctrl-C handler fired between the last worker
+    // completing and us reaching here, treat it as a cancellation.
     if user_cancelled.load(Ordering::Relaxed) {
+        pb_files.abandon_with_message("cancelled");
+        pb_bytes.abandon_with_message("cancelled");
         return Ok(false);
     }
 
-    match (setup_result, data_result) {
-        (Ok(()), Ok(())) => {}
-        (Err(e), Ok(())) => return Err(e).context("MojoSetup extraction failed"),
-        (Ok(()), Err(e)) => return Err(e).context("Game data extraction failed"),
-        (Err(setup_err), Err(data_err)) => {
-            anyhow::bail!(
-                "Extraction failed:\n  MojoSetup: {setup_err:#}\n  Game data: {data_err:#}"
-            );
-        }
-    }
+    pb_files.finish_with_message("done");
+    pb_bytes.finish_with_message("done");
+
+    // --- Move staging output into final location ---
 
     finalize_output(&layout)?;
     staging_cleanup.disarm();
+
+    // --- Summary ---
+
+    let elapsed = extraction_start.elapsed();
+    let total_mib = total_bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "\n  {} files  {:.1} MiB  in {:.1}s",
+        total_files,
+        total_mib,
+        elapsed.as_secs_f64(),
+    );
 
     Ok(true)
 }
