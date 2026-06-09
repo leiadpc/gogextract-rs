@@ -8,6 +8,7 @@ gogextract.py rewrite in Rust with enhancements
 A few notable differences in operation
 
 - Only extracts\decompresses game data not the the install script or mojosetup files
+- Only works with installers that use standard zip compression for the game files
 - Extracts into a temp folder first then moves into a folder named after the installer
 
 
