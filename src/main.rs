@@ -91,14 +91,13 @@ impl<'a, R: Read> Read for CancellableReader<'a, R> {
         // Poll cancellation flag before each chunk.
         if self.bytes_since_check >= CANCEL_CHECK_INTERVAL_BYTES {
             if !self.running.load(Ordering::Relaxed) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                // FIX: Use ErrorKind::Other instead of ErrorKind::Interrupted
+                // so io::copy doesn't catch it and infinitely retry.
+                return Err(io::Error::new(io::ErrorKind::Other, "cancelled"));
             }
             self.bytes_since_check = 0;
         }
 
-        // Read into our own buffer to control the chunk size, then copy to
-        // `out`.  This ensures io::copy gets COPY_BUFFER_SIZE-sized reads
-        // even though ZipFile's own Read impl uses small internal chunks.
         let want = out.len().min(COPY_BUFFER_SIZE);
         let n = self.inner.read(&mut self.buf[..want])?;
         out[..n].copy_from_slice(&self.buf[..n]);
