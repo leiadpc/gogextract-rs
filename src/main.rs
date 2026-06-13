@@ -8,8 +8,9 @@ mod mojo;
 use anyhow::{Context, Result};
 use clap::Parser;
 use mojo::ArcMmap;
+use std::ffi::OsStr;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -41,6 +42,23 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
+// Shared helper — deduplicates the default output-dir logic used in all four
+// extract entry points (inno CLI, inno GUI, mojo CLI, mojo GUI).
+// ---------------------------------------------------------------------------
+
+pub fn default_output_dir(input: &Path) -> PathBuf {
+    let base = input
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    base.join(
+        input
+            .file_stem()
+            .unwrap_or(OsStr::new("extracted_game_data")),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Installer type detection (shared by CLI and GUI worker thread)
 // ---------------------------------------------------------------------------
 
@@ -53,9 +71,11 @@ pub enum InstallerKind {
 pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
     let data = mmap.as_ref();
 
-    // 1. Check for Inno Setup Windows installer signatures
+    // 1. Check for Inno Setup Windows installer signatures.
+    //    Inno data is appended after the PE stub and can sit beyond 1 MiB on
+    //    larger titles, so we scan up to 8 MiB.
     const INNO_MAGIC: &[u8] = b"Inno Setup Setup Data";
-    const SCAN_LIMIT: usize = 1024 * 1024; // 1 MiB
+    const SCAN_LIMIT: usize = 8 * 1024 * 1024;
     let scan_end = data.len().min(SCAN_LIMIT);
     if data[..scan_end]
         .windows(INNO_MAGIC.len())
@@ -64,7 +84,7 @@ pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
         return Ok(InstallerKind::Inno);
     }
 
-    // 2. Check for traditional ZIP archives or appended script ZIP structures (Linux .sh)
+    // 2. Check for traditional ZIP archives or appended-script ZIP structures (.sh).
     const EOCD_SIG: &[u8] = b"PK\x05\x06";
     const MAX_EOCD_SEARCH: usize = 65535 + 22;
     let search_start = data.len().saturating_sub(MAX_EOCD_SEARCH);
@@ -77,7 +97,10 @@ pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
         return Ok(InstallerKind::MojoSetup);
     }
 
-    anyhow::bail!("Unrecognised installer format — expected a MojoSetup installer (.sh/.exe) or an Inno Setup executable.");
+    anyhow::bail!(
+        "Unrecognised installer format — expected a MojoSetup installer \
+         (.sh/.exe) or an Inno Setup executable."
+    );
 }
 
 // ---------------------------------------------------------------------------
