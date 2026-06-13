@@ -43,40 +43,10 @@ enum State {
     Cancelled,
 }
 
-// Added Serde macro derivations to allow automatic state saving
-#[derive(PartialEq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-enum AppTheme {
-    TokyoNight,
-    TokyoNightLight,
-    Dracula,
-    Alucard,
-    SolarizedDark,
-    SolarizedLight,
-    GruvboxDark,
-    GruvboxLight,
-}
-
-impl std::fmt::Display for AppTheme {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            AppTheme::TokyoNight => "Tokyo Night",
-            AppTheme::TokyoNightLight => "Tokyo Night Light",
-            AppTheme::Dracula => "Dracula",
-            AppTheme::Alucard => "Alucard",
-            AppTheme::SolarizedDark => "Solarized Dark",
-            AppTheme::SolarizedLight => "Solarized Light",
-            AppTheme::GruvboxDark => "Gruvbox Dark",
-            AppTheme::GruvboxLight => "Gruvbox Light",
-        };
-        write!(f, "{}", s)
-    }
-}
-
 pub struct App {
     state: State,
-    active_theme: AppTheme,
-    installer_path: Option<PathBuf>,
-    output_dir: Option<PathBuf>,
+    installer_path_str: String,
+    output_dir_str: String,
     /// The output dir that was actually used by the last successful extraction,
     /// kept separately so the "Open Output Folder" button survives state resets.
     last_output_dir: Option<PathBuf>,
@@ -99,27 +69,14 @@ pub struct App {
 }
 
 impl App {
-    /// Creates a state container, optionally recovering data from a previous crash or session.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// Creates a state container.
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = mpsc::channel();
-
-        // Default theme to fallback on if no storage exists yet
-        let mut active_theme = AppTheme::TokyoNight;
-
-        // Try reading the previously saved configuration context
-        if let Some(storage) = cc.storage {
-            if let Some(theme_str) = storage.get_string("selected_theme") {
-                if let Ok(parsed_theme) = serde_json::from_str::<AppTheme>(&theme_str) {
-                    active_theme = parsed_theme;
-                }
-            }
-        }
 
         Self {
             state: State::Idle,
-            active_theme,
-            installer_path: None,
-            output_dir: None,
+            installer_path_str: String::new(),
+            output_dir_str: String::new(),
             last_output_dir: None,
             force_overwrite: false,
             detected_kind: "Unknown".to_owned(),
@@ -170,11 +127,18 @@ impl App {
                     file_count,
                 } => {
                     self.state = State::Done;
-                    self.last_output_dir = self.output_dir.clone().or_else(|| {
-                        self.installer_path
-                            .as_deref()
-                            .map(crate::default_output_dir)
-                    });
+
+                    let out_path = PathBuf::from(&self.output_dir_str);
+                    if !self.output_dir_str.trim().is_empty() {
+                        self.last_output_dir = Some(out_path);
+                    } else if !self.installer_path_str.trim().is_empty() {
+                        self.last_output_dir = Some(crate::default_output_dir(&PathBuf::from(
+                            &self.installer_path_str,
+                        )));
+                    } else {
+                        self.last_output_dir = None;
+                    }
+
                     self.summary_text = format!(
                         "✓ Successfully extracted {} files in {:.1} seconds.",
                         file_count, elapsed_secs
@@ -199,8 +163,15 @@ impl App {
     }
 
     fn start_extraction(&mut self, ctx: &egui::Context) {
-        let Some(input_file) = self.installer_path.clone() else {
+        if self.installer_path_str.trim().is_empty() {
             return;
+        }
+        let input_file = PathBuf::from(&self.installer_path_str);
+
+        let out_dir = if self.output_dir_str.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(&self.output_dir_str))
         };
 
         self.state = State::Running;
@@ -217,7 +188,6 @@ impl App {
         let tx = self.tx.clone();
         let running = self.running_flag.clone();
         let user_cancelled = self.cancelled_flag.clone();
-        let out_dir = self.output_dir.clone();
         let force = self.force_overwrite;
 
         std::thread::spawn(move || {
@@ -272,13 +242,13 @@ impl App {
         warn: Color32,
         default_text: Color32,
     ) -> Color32 {
-        if line.starts_with("✓") {
+        if line.starts_with('✓') {
             return success;
         }
-        if line.starts_with("✗") {
+        if line.starts_with('✗') {
             return danger;
         }
-        if line.starts_with("⚠️") || line.starts_with("⚠") {
+        if line.starts_with("⚠️") || line.starts_with('⚠') {
             return warn;
         }
 
@@ -301,8 +271,10 @@ impl App {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if let Some(first) = dropped.into_iter().next() {
             if let Some(path) = first.path {
-                self.output_dir = Some(crate::default_output_dir(&path));
-                self.installer_path = Some(path);
+                self.output_dir_str = crate::default_output_dir(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                self.installer_path_str = path.to_string_lossy().into_owned();
                 self.detected_kind = "Unknown".to_owned();
             }
         }
@@ -310,186 +282,41 @@ impl App {
 }
 
 impl eframe::App for App {
-    /// Saves application preferences to persistent storage right before closure.
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Ok(theme_json) = serde_json::to_string(&self.active_theme) {
-            storage.set_string("selected_theme", theme_json);
-        }
-    }
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
         self.drain_events(ctx);
 
-        // Helper boolean to dictate overall dark or light behavior
-        let is_light_theme = matches!(
-            self.active_theme,
-            AppTheme::TokyoNightLight
-                | AppTheme::Alucard
-                | AppTheme::SolarizedLight
-                | AppTheme::GruvboxLight
-        );
+        // Derive color standards by matching the active egui-configured system context
+        let is_dark = ctx.style().visuals.dark_mode;
 
-        let mut visuals = if is_light_theme {
-            egui::Visuals::light()
+        let success_col = if is_dark {
+            Color32::from_rgb(158, 206, 106)
         } else {
-            egui::Visuals::dark()
+            Color32::from_rgb(72, 94, 28)
+        };
+        let danger_col = if is_dark {
+            Color32::from_rgb(247, 118, 142)
+        } else {
+            Color32::from_rgb(140, 43, 62)
+        };
+        let warn_col = if is_dark {
+            Color32::from_rgb(224, 175, 104)
+        } else {
+            Color32::from_rgb(143, 91, 0)
+        };
+        let log_text_default = if is_dark {
+            Color32::from_gray(210)
+        } else {
+            Color32::from_rgb(52, 53, 64)
         };
 
-        // Map colors according to the selected theme profile
-        let (bg_color, success_col, danger_col, warn_col, log_text_default) =
-            match self.active_theme {
-                AppTheme::TokyoNight => {
-                    visuals.panel_fill = Color32::from_rgb(26, 27, 38);
-                    visuals.window_fill = Color32::from_rgb(26, 27, 38);
-                    visuals.selection.bg_fill = Color32::from_rgb(122, 162, 247);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(26, 27, 38),
-                        Color32::from_rgb(158, 206, 106),
-                        Color32::from_rgb(247, 118, 142),
-                        Color32::from_rgb(224, 175, 104),
-                        Color32::from_gray(210),
-                    )
-                }
-                AppTheme::TokyoNightLight => {
-                    visuals.panel_fill = Color32::from_rgb(240, 241, 244);
-                    visuals.window_fill = Color32::from_rgb(240, 241, 244);
-                    visuals.selection.bg_fill = Color32::from_rgb(52, 90, 182);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(240, 241, 244),
-                        Color32::from_rgb(72, 94, 28),
-                        Color32::from_rgb(140, 43, 62),
-                        Color32::from_rgb(143, 91, 0),
-                        Color32::from_rgb(52, 53, 64),
-                    )
-                }
-                AppTheme::Dracula => {
-                    visuals.panel_fill = Color32::from_rgb(40, 42, 54);
-                    visuals.window_fill = Color32::from_rgb(40, 42, 54);
-                    visuals.selection.bg_fill = Color32::from_rgb(255, 121, 198);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(40, 42, 54),
-                        Color32::from_rgb(80, 250, 123),
-                        Color32::from_rgb(255, 85, 85),
-                        Color32::from_rgb(241, 250, 140),
-                        Color32::from_gray(210),
-                    )
-                }
-                AppTheme::Alucard => {
-                    visuals.panel_fill = Color32::from_rgb(248, 248, 242);
-                    visuals.window_fill = Color32::from_rgb(248, 248, 242);
-                    visuals.selection.bg_fill = Color32::from_rgb(255, 121, 198);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(244, 244, 234),
-                        Color32::from_rgb(46, 125, 50),
-                        Color32::from_rgb(211, 47, 47),
-                        Color32::from_rgb(199, 125, 0),
-                        Color32::from_rgb(40, 42, 54),
-                    )
-                }
-                AppTheme::SolarizedDark => {
-                    visuals.panel_fill = Color32::from_rgb(0, 43, 54);
-                    visuals.window_fill = Color32::from_rgb(0, 43, 54);
-                    visuals.selection.bg_fill = Color32::from_rgb(38, 139, 210);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(0, 43, 54),
-                        Color32::from_rgb(133, 153, 0),
-                        Color32::from_rgb(220, 50, 47),
-                        Color32::from_rgb(181, 137, 0),
-                        Color32::from_gray(210),
-                    )
-                }
-                AppTheme::SolarizedLight => {
-                    visuals.panel_fill = Color32::from_rgb(253, 246, 227);
-                    visuals.window_fill = Color32::from_rgb(253, 246, 227);
-                    visuals.selection.bg_fill = Color32::from_rgb(147, 161, 161);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(253, 246, 227),
-                        Color32::from_rgb(133, 153, 0),
-                        Color32::from_rgb(220, 50, 47),
-                        Color32::from_rgb(181, 137, 0),
-                        Color32::from_rgb(101, 123, 131),
-                    )
-                }
-                AppTheme::GruvboxDark => {
-                    visuals.panel_fill = Color32::from_rgb(40, 40, 40);
-                    visuals.window_fill = Color32::from_rgb(40, 40, 40);
-                    visuals.selection.bg_fill = Color32::from_rgb(214, 93, 14);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(40, 40, 40),
-                        Color32::from_rgb(184, 187, 38),
-                        Color32::from_rgb(251, 73, 52),
-                        Color32::from_rgb(250, 189, 47),
-                        Color32::from_gray(210),
-                    )
-                }
-                AppTheme::GruvboxLight => {
-                    visuals.panel_fill = Color32::from_rgb(251, 241, 199);
-                    visuals.window_fill = Color32::from_rgb(251, 241, 199);
-                    visuals.selection.bg_fill = Color32::from_rgb(214, 93, 14);
-                    ctx.set_visuals(visuals);
-                    (
-                        Color32::from_rgb(251, 241, 199),
-                        Color32::from_rgb(121, 116, 14),
-                        Color32::from_rgb(157, 0, 6),
-                        Color32::from_rgb(181, 118, 20),
-                        Color32::from_rgb(60, 56, 54),
-                    )
-                }
-            };
+        let canvas_bg = ctx.style().visuals.extreme_bg_color;
+        let border_color = ctx.style().visuals.widgets.noninteractive.bg_stroke.color;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
 
-            // Dropdown Menu Theme Selection Controls
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("🎨 UI Theme:").strong());
-                egui::ComboBox::from_id_salt("theme_dropdown")
-                    .selected_text(self.active_theme.to_string())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.active_theme,
-                            AppTheme::TokyoNight,
-                            "Tokyo Night",
-                        );
-                        ui.selectable_value(
-                            &mut self.active_theme,
-                            AppTheme::TokyoNightLight,
-                            "Tokyo Night Light",
-                        );
-                        ui.selectable_value(&mut self.active_theme, AppTheme::Dracula, "Dracula");
-                        ui.selectable_value(&mut self.active_theme, AppTheme::Alucard, "Alucard");
-                        ui.selectable_value(
-                            &mut self.active_theme,
-                            AppTheme::SolarizedDark,
-                            "Solarized Dark",
-                        );
-                        ui.selectable_value(
-                            &mut self.active_theme,
-                            AppTheme::SolarizedLight,
-                            "Solarized Light",
-                        );
-                        ui.selectable_value(
-                            &mut self.active_theme,
-                            AppTheme::GruvboxDark,
-                            "Gruvbox Dark",
-                        );
-                        ui.selectable_value(
-                            &mut self.active_theme,
-                            AppTheme::GruvboxLight,
-                            "Gruvbox Light",
-                        );
-                    });
-            });
-
-            if self.state == State::Idle && self.installer_path.is_none() {
+            if self.state == State::Idle && self.installer_path_str.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(
@@ -509,6 +336,7 @@ impl eframe::App for App {
                     .spacing([10.0, 8.0])
                     .min_col_width(80.0)
                     .show(ui, |ui| {
+                        // --- ROW 1: Installer Entry ---
                         ui.label(RichText::new("Installer:").strong());
                         if ui.button("📁 Browse...").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
@@ -518,48 +346,48 @@ impl eframe::App for App {
                                 )
                                 .pick_file()
                             {
-                                self.output_dir = Some(crate::default_output_dir(&path));
-                                self.installer_path = Some(path);
+                                self.installer_path_str = path.to_string_lossy().into_owned();
+                                self.output_dir_str = crate::default_output_dir(&path)
+                                    .to_string_lossy()
+                                    .into_owned();
                                 self.detected_kind = "Unknown".to_owned();
                             }
                         }
-                        if let Some(p) = &self.installer_path {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(
-                                        p.file_name().unwrap_or_default().to_string_lossy(),
-                                    )
-                                    .monospace(),
-                                )
-                                .truncate(),
-                            );
-                        } else {
-                            ui.label(RichText::new("No file selected").italics().weak());
-                        }
+
+                        // Textbox width takes up the rest of the layout space
+                        let edit_width = ui.available_width();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.installer_path_str)
+                                .hint_text("/path/to/installer.sh")
+                                .desired_width(edit_width),
+                        );
                         ui.end_row();
 
+                        // --- ROW 2: Output Dir Entry ---
                         ui.label(RichText::new("Output Dir:").strong());
                         ui.horizontal(|ui| {
                             if ui.button("📁 Browse...").clicked() {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                    self.output_dir = Some(path);
+                                    self.output_dir_str = path.to_string_lossy().into_owned();
                                 }
                             }
                             if ui.button("↺ Reset").clicked() {
-                                self.output_dir = self
-                                    .installer_path
-                                    .as_deref()
-                                    .map(crate::default_output_dir);
+                                if !self.installer_path_str.trim().is_empty() {
+                                    let path = PathBuf::from(&self.installer_path_str);
+                                    self.output_dir_str = crate::default_output_dir(&path)
+                                        .to_string_lossy()
+                                        .into_owned();
+                                } else {
+                                    self.output_dir_str.clear();
+                                }
                             }
                         });
-                        if let Some(p) = &self.output_dir {
-                            ui.add(
-                                egui::Label::new(RichText::new(p.to_string_lossy()).monospace())
-                                    .truncate(),
-                            );
-                        } else {
-                            ui.label(RichText::new("No file selected yet").italics().weak());
-                        }
+
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.output_dir_str)
+                                .hint_text("/path/to/output_dir")
+                                .desired_width(edit_width),
+                        );
                         ui.end_row();
                     });
 
@@ -571,8 +399,8 @@ impl eframe::App for App {
             });
 
             ui.horizontal(|ui| {
-                let can_extract =
-                    self.installer_path.is_some() && !self.running_flag.load(Ordering::Relaxed);
+                let can_extract = !self.installer_path_str.trim().is_empty()
+                    && !self.running_flag.load(Ordering::Relaxed);
                 let btn_extract =
                     egui::Button::new(RichText::new("🚀 Extract Game").strong().size(14.0));
 
@@ -605,23 +433,22 @@ impl eframe::App for App {
                             .monospace()
                             .strong()
                             .color(if self.detected_kind.contains("MojoSetup") {
-                                match self.active_theme {
-                                    AppTheme::TokyoNightLight => Color32::from_rgb(52, 90, 182),
-                                    AppTheme::Alucard => Color32::from_rgb(139, 92, 246),
-                                    _ => Color32::from_rgb(189, 147, 249),
+                                if is_dark {
+                                    Color32::from_rgb(189, 147, 249)
+                                } else {
+                                    Color32::from_rgb(52, 90, 182)
                                 }
                             } else if self.detected_kind.contains("Inno") {
-                                match self.active_theme {
-                                    AppTheme::SolarizedDark => Color32::from_rgb(42, 161, 152),
-                                    AppTheme::SolarizedLight => Color32::from_rgb(181, 137, 0),
-                                    AppTheme::Alucard => Color32::from_rgb(0, 180, 216),
-                                    _ => Color32::from_rgb(139, 233, 253),
+                                if is_dark {
+                                    Color32::from_rgb(139, 233, 253)
+                                } else {
+                                    Color32::from_rgb(181, 137, 0)
                                 }
                             } else {
-                                if is_light_theme {
-                                    Color32::from_gray(100)
-                                } else {
+                                if is_dark {
                                     Color32::from_gray(140)
+                                } else {
+                                    Color32::from_gray(100)
                                 }
                             }),
                     );
@@ -681,14 +508,8 @@ impl eframe::App for App {
             ui.label(RichText::new("Terminal Logs:").strong());
             let remaining_height = ui.available_height() - 5.0;
 
-            let border_color = if is_light_theme {
-                Color32::from_gray(190)
-            } else {
-                Color32::from_gray(60)
-            };
-
             egui::Frame::canvas(ui.style())
-                .fill(bg_color)
+                .fill(canvas_bg)
                 .stroke(Stroke::new(1.0, border_color))
                 .inner_margin(6.0)
                 .show(ui, |ui| {
