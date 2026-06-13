@@ -77,7 +77,7 @@ impl<'a, R: Read> CancellableReader<'a, R> {
 
 impl<'a, R: Read> Read for CancellableReader<'a, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        // Poll cancellation flag at coarse intervals to minimize atomic overhead.
+        // Poll cancellation flag at coarse intervals to minimise atomic overhead.
         if self.bytes_since_check >= CANCEL_CHECK_INTERVAL_BYTES {
             if !self.running.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::Other, "cancelled"));
@@ -85,7 +85,6 @@ impl<'a, R: Read> Read for CancellableReader<'a, R> {
             self.bytes_since_check = 0;
         }
 
-        // Stream directly into the caller's output buffer (Zero-copy optimization)
         let n = self.inner.read(out)?;
         self.bytes_since_check += n;
         Ok(n)
@@ -124,6 +123,8 @@ impl StagingCleanup {
 impl Drop for StagingCleanup {
     fn drop(&mut self) {
         if self.armed {
+            // Use eprintln! here — by the time Drop runs the progress bars are
+            // already abandoned/finished, so there is no display to clobber.
             if let Err(e) = fs::remove_dir_all(&self.staging_dir) {
                 eprintln!(
                     "Warning: failed to clean up staging directory {}: {}",
@@ -329,7 +330,29 @@ pub fn list(mmap: &ArcMmap) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Parallel ZIP extraction
+// Parallel ZIP extraction — helper that scans metadata in one parallel pass.
+// Returns (file_count, total_uncompressed_bytes), skipping directory entries.
+// ---------------------------------------------------------------------------
+
+fn scan_zip_metadata(mmap: &ArcMmap, count: usize) -> (usize, u64) {
+    (0..count)
+        .into_par_iter()
+        .map_with(Cursor::new(mmap.clone()), |cursor, i| {
+            if let Ok(mut archive) = zip::ZipArchive::new(cursor) {
+                if let Ok(entry) = archive.by_index(i) {
+                    if !entry.is_dir() {
+                        return (1usize, entry.size());
+                    }
+                }
+            }
+            // Directory entries and failed reads contribute nothing.
+            (0, 0)
+        })
+        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+}
+
+// ---------------------------------------------------------------------------
+// CLI extraction
 // ---------------------------------------------------------------------------
 
 pub fn extract(
@@ -340,36 +363,13 @@ pub fn extract(
     running: &Arc<AtomicBool>,
     user_cancelled: &Arc<AtomicBool>,
 ) -> Result<bool> {
-    let resolved_output_dir = output_dir.unwrap_or_else(|| {
-        let base = input_file
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        base.join(
-            input_file
-                .file_stem()
-                .unwrap_or_else(|| std::ffi::OsStr::new("extracted_game_data")),
-        )
-    });
+    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
 
     let count = zip::ZipArchive::new(Cursor::new(mmap.clone()))
         .context("Failed to open ZIP archive")?
         .len();
 
-    // Fast, multi-threaded metadata analysis via Parallel Iterator Bridge
-    let (total_files, total_bytes) = (0..count)
-        .into_par_iter()
-        .map_with(Cursor::new(mmap.clone()), |cursor, i| {
-            if let Ok(mut archive) = zip::ZipArchive::new(cursor) {
-                if let Ok(entry) = archive.by_index(i) {
-                    if !entry.is_dir() {
-                        return (1, entry.size());
-                    }
-                }
-            }
-            (1, 0)
-        })
-        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let (total_files, total_bytes) = scan_zip_metadata(mmap, count);
 
     let layout = prepare_output_layout(&resolved_output_dir, force)?;
     let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
@@ -451,7 +451,7 @@ pub fn extract(
                     )?;
                 }
 
-                // Cache line performance improvement: fetch clock metadata AFTER completing I/O bound tasks
+                // Fetch clock metadata after I/O to minimise atomic contention.
                 let now_ns = extraction_start.elapsed().as_nanos() as u64;
                 let interval_ns = PROGRESS_MSG_INTERVAL.as_nanos() as u64;
                 let last_ns = last_msg_nanos.load(Ordering::Relaxed);
@@ -475,6 +475,8 @@ pub fn extract(
         },
     );
 
+    // Single consolidated cancellation check — no duplicate block needed after
+    // this match because the Cancelled arm already returns early.
     match extract_result {
         Ok(()) => {}
         Err(e)
@@ -488,14 +490,6 @@ pub fn extract(
             return Ok(false);
         }
         Err(e) => return Err(e),
-    }
-
-    if user_cancelled.load(Ordering::Relaxed) {
-        pb_files.abandon_with_message("cancelled");
-        pb_bytes.abandon_with_message("cancelled");
-        drop(staging_cleanup);
-        let _ = fs::remove_dir(&resolved_output_dir);
-        return Ok(false);
     }
 
     pb_files.finish_with_message("done");
@@ -516,6 +510,10 @@ pub fn extract(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// GUI extraction path
+// ---------------------------------------------------------------------------
+
 #[cfg(feature = "gui")]
 use crate::gui::GuiEvent;
 #[cfg(feature = "gui")]
@@ -531,36 +529,13 @@ pub fn extract_gui(
     user_cancelled: &Arc<AtomicBool>,
     tx: &mpsc::Sender<GuiEvent>,
 ) -> Result<bool> {
-    let resolved_output_dir = output_dir.unwrap_or_else(|| {
-        let base = input_file
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        base.join(
-            input_file
-                .file_stem()
-                .unwrap_or_else(|| std::ffi::OsStr::new("extracted_game_data")),
-        )
-    });
+    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
 
     let count = zip::ZipArchive::new(Cursor::new(mmap.clone()))
         .context("Failed to open ZIP archive")?
         .len();
 
-    // Fast multi-threaded archive scanning for GUI metrics
-    let (total_files, total_bytes) = (0..count)
-        .into_par_iter()
-        .map_with(Cursor::new(mmap.clone()), |cursor, i| {
-            if let Ok(mut archive) = zip::ZipArchive::new(cursor) {
-                if let Ok(entry) = archive.by_index(i) {
-                    if !entry.is_dir() {
-                        return (1, entry.size());
-                    }
-                }
-            }
-            (1, 0)
-        })
-        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let (total_files, total_bytes) = scan_zip_metadata(mmap, count);
 
     let layout = prepare_output_layout(&resolved_output_dir, force)?;
     let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
@@ -644,7 +619,7 @@ pub fn extract_gui(
                 let bd = bytes_extracted.fetch_add(written, Ordering::Relaxed) + written;
                 let fd = files_extracted.fetch_add(1, Ordering::Relaxed) + 1;
 
-                // UI event throttling to prevent channel congestion and GUI framing latency
+                // UI event throttling to prevent channel congestion.
                 let now_ns = extraction_start.elapsed().as_nanos() as u64;
                 let interval_ns = PROGRESS_MSG_INTERVAL.as_nanos() as u64;
                 let last_ns = last_msg_nanos.load(Ordering::Relaxed);
@@ -669,6 +644,7 @@ pub fn extract_gui(
         },
     );
 
+    // Single consolidated cancellation check.
     match extract_result {
         Ok(()) => {}
         Err(e)
@@ -682,12 +658,7 @@ pub fn extract_gui(
         Err(e) => return Err(e),
     }
 
-    if user_cancelled.load(Ordering::Relaxed) {
-        drop(staging_cleanup);
-        let _ = fs::remove_dir(&resolved_output_dir);
-        return Ok(false);
-    }
-
+    // Send a final progress tick to ensure the GUI reaches 100%.
     let _ = tx.send(GuiEvent::Progress {
         files_done: total_files as u64,
         files_total: total_files as u64,
