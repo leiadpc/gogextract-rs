@@ -42,6 +42,7 @@ pub enum GuiEvent {
 enum State {
     Idle,
     Running,
+    Cancelling,
     Done,
     Failed,
     Cancelled,
@@ -126,10 +127,18 @@ impl App {
                     file_count,
                 } => {
                     self.state = State::Done;
-                    self.summary_text = format!(
-                        "✓ Successfully extracted {} files ({:.2} MiB) in {:.1} seconds.",
-                        file_count, total_mib, elapsed_secs
-                    );
+                    self.summary_text = if total_mib > 0.0 {
+                        format!(
+                            "✓ Successfully extracted {} files ({:.2} MiB) in {:.1} seconds.",
+                            file_count, total_mib, elapsed_secs
+                        )
+                    } else {
+                        // innoextract path: byte totals unavailable.
+                        format!(
+                            "✓ Successfully extracted {} files in {:.1} seconds.",
+                            file_count, elapsed_secs
+                        )
+                    };
                     self.running_flag.store(false, Ordering::Relaxed);
                 }
                 GuiEvent::Failed(err) => {
@@ -137,6 +146,9 @@ impl App {
                     self.error_text = err;
                     self.running_flag.store(false, Ordering::Relaxed);
                 }
+                // State only transitions to Cancelled when the worker confirms it,
+                // not when the button is clicked — avoids a race where a late Done
+                // or Failed event would overwrite the terminal state.
                 GuiEvent::Cancelled => {
                     self.state = State::Cancelled;
                     self.running_flag.store(false, Ordering::Relaxed);
@@ -178,19 +190,28 @@ impl App {
                 &user_cancelled,
                 &tx,
             );
-            if let Err(e) = res {
-                let _ = tx.send(GuiEvent::Failed(format!("{e:#}")));
+            match res {
+                Ok(true) => {} // Done event already sent by extract_gui
+                Ok(false) => {
+                    // Worker wound down cleanly after cancellation; confirm to GUI.
+                    let _ = tx.send(GuiEvent::Cancelled);
+                }
+                Err(e) => {
+                    let _ = tx.send(GuiEvent::Failed(format!("{e:#}")));
+                }
             }
         });
     }
 
     fn cancel_extraction(&mut self) {
+        // Signal the worker to stop, then wait for its Cancelled event before
+        // transitioning state — this prevents a race with late Done/Failed events.
+        self.running_flag.store(false, Ordering::Relaxed);
+        self.cancelled_flag.store(true, Ordering::Relaxed);
+        self.state = State::Cancelling;
         let _ = self
             .tx
             .send(GuiEvent::Log("⚠️ Cancellation requested...".to_owned()));
-        self.running_flag.store(false, Ordering::Relaxed);
-        self.cancelled_flag.store(true, Ordering::Relaxed);
-        self.state = State::Cancelled;
     }
 }
 
@@ -198,7 +219,6 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        // FIX: Query the context directly for the system theme
         if let Some(system_theme) = ctx.system_theme() {
             let is_dark_visuals = ctx.style().visuals.dark_mode;
 
@@ -213,7 +233,7 @@ impl eframe::App for App {
             }
         }
 
-        if self.state == State::Running {
+        if self.state == State::Running || self.state == State::Cancelling {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
@@ -242,6 +262,9 @@ impl eframe::App for App {
                                 )
                                 .pick_file()
                             {
+                                // Auto-populate output dir with the computed default
+                                // so the user can see (and edit) where files will go.
+                                self.output_dir = Some(crate::default_output_dir(&path));
                                 self.installer_path = Some(path);
                                 self.detected_kind = "Unknown".to_owned();
                             }
@@ -257,19 +280,23 @@ impl eframe::App for App {
                         ui.end_row();
 
                         ui.label(RichText::new("Output Dir:").strong());
-                        if ui.button("📁 Browse...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.output_dir = Some(path);
+                        ui.horizontal(|ui| {
+                            if ui.button("📁 Browse...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                    self.output_dir = Some(path);
+                                }
                             }
-                        }
+                            if ui.button("↺ Reset").clicked() {
+                                self.output_dir = self
+                                    .installer_path
+                                    .as_deref()
+                                    .map(crate::default_output_dir);
+                            }
+                        });
                         if let Some(p) = &self.output_dir {
                             ui.label(RichText::new(p.to_string_lossy()).monospace());
                         } else {
-                            ui.label(
-                                RichText::new("Same folder as installer (default)")
-                                    .italics()
-                                    .weak(),
-                            );
+                            ui.label(RichText::new("No file selected yet").italics().weak());
                         }
                         ui.end_row();
                     });
@@ -283,7 +310,10 @@ impl eframe::App for App {
 
             // 3. Control Layout Panel
             ui.horizontal(|ui| {
-                let can_extract = self.installer_path.is_some() && self.state != State::Running;
+                // Guard on running_flag rather than state alone: prevents starting
+                // a second worker while a cancelled one is still winding down.
+                let can_extract =
+                    self.installer_path.is_some() && !self.running_flag.load(Ordering::Relaxed);
                 let btn_extract =
                     egui::Button::new(RichText::new("🚀 Extract Game").strong().size(14.0));
 
@@ -291,9 +321,11 @@ impl eframe::App for App {
                     self.start_extraction();
                 }
 
-                let is_running = self.state == State::Running;
                 let btn_cancel = egui::Button::new(RichText::new("🛑 Cancel").strong().size(14.0));
-                if ui.add_enabled(is_running, btn_cancel).clicked() {
+                if ui
+                    .add_enabled(self.state == State::Running, btn_cancel)
+                    .clicked()
+                {
                     self.cancel_extraction();
                 }
 
@@ -314,8 +346,8 @@ impl eframe::App for App {
                 });
             });
 
-            // 4. Progress Container - Only rendered when State is actively Running
-            if self.state == State::Running {
+            // 4. Progress Container — shown while running or winding down after cancel.
+            if self.state == State::Running || self.state == State::Cancelling {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     if !self.current_file.is_empty() {
@@ -327,11 +359,7 @@ impl eframe::App for App {
                     }
 
                     if self.files_total > 0 {
-                        let file_pct = if self.files_total > 0 {
-                            self.files_done as f32 / self.files_total as f32
-                        } else {
-                            0.0
-                        };
+                        let file_pct = self.files_done as f32 / self.files_total as f32;
                         ui.horizontal(|ui| {
                             ui.label(format!("Files: {} / {}", self.files_done, self.files_total));
                             ui.add(
@@ -342,11 +370,7 @@ impl eframe::App for App {
                     }
 
                     if self.bytes_total > 0 {
-                        let byte_pct = if self.bytes_total > 0 {
-                            self.bytes_done as f64 / self.bytes_total as f64
-                        } else {
-                            0.0
-                        };
+                        let byte_pct = self.bytes_done as f64 / self.bytes_total as f64;
                         let done_mib = self.bytes_done as f64 / (1024.0 * 1024.0);
                         let total_mib = self.bytes_total as f64 / (1024.0 * 1024.0);
 
@@ -368,6 +392,9 @@ impl eframe::App for App {
                 }
                 State::Failed => {
                     ui.colored_label(danger, format!("✗ Error: {}", self.error_text));
+                }
+                State::Cancelling => {
+                    ui.colored_label(warn, "⏳ Cancelling — waiting for worker to stop...");
                 }
                 State::Cancelled => {
                     ui.colored_label(warn, "🚨 Extraction was aborted and cleaned up.");
