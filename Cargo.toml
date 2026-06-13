@@ -1,6 +1,6 @@
 [package]
 name = "gogextract"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
 
 [dependencies]
@@ -11,13 +11,15 @@ indicatif = "0.17"
 memmap2 = "0.9"
 rayon = "1.10"
 zip = "2.0"
-eframe  = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland"] }
+eframe  = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "persistence"] }
 egui    = { version = "0.31", optional = true }
 rfd     = { version = "0.15", optional = true }
+serde   = { version = "1.0", optional = true, features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
 
 [features]
 default = ["gui"]
-gui = ["eframe", "egui", "rfd"]
+gui = ["eframe", "egui", "rfd", "serde", "serde_json"]
 
 # Optional: Add release profile optimizations for maximum extraction speed
 [profile.release]
