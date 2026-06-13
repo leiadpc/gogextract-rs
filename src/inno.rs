@@ -93,6 +93,22 @@ pub fn extract(
     println!("Extracting to: {}\n", resolved_output_dir.display());
     println!("Press Ctrl+C to cancel.\n");
 
+    // Pre-scan with --list to get a file count so we can show a determinate
+    // progress bar. --list reads headers only (no decompression) so it's fast.
+    // If it fails for any reason we fall back to an indeterminate spinner.
+    let known_file_count: Option<u64> = list_lines(input_file)
+        .ok()
+        .map(|lines| {
+            // Count only lines that look like extracted files ("  - path/to/file").
+            lines
+                .iter()
+                .filter(|l| l.trim_start().starts_with('-'))
+                .count() as u64
+        })
+        .filter(|&n| n > 0);
+
+    let extraction_start = std::time::Instant::now();
+
     let mut child = std::process::Command::new("innoextract")
         .arg("--output-dir")
         .arg(&resolved_output_dir)
@@ -107,11 +123,19 @@ pub fn extract(
     let child_stderr = child.stderr.take().expect("stderr piped");
 
     // Both stdout and stderr are pumped into a single mpsc channel so the main
-    // thread can drive the spinner and poll cancellation without select().
+    // thread can drive the progress bar and poll cancellation without select().
     enum Event {
-        /// A filename line from stdout — shown as the spinner message.
+        /// A filename line from stdout — shown as the progress bar message.
+        ///
+        /// innoextract prints one line per extracted file in the form:
+        ///   "  - path/to/file"
+        /// We strip the leading whitespace and dash prefix so the bar shows
+        /// a clean filename. The trim chain is:
+        ///   1. trim()                  — removes surrounding whitespace
+        ///   2. trim_start_matches('-') — removes the leading dash
+        ///   3. trim()                  — removes the space left between dash and path
         Filename(String),
-        /// A stderr line (warnings / info) — printed above the spinner.
+        /// A stderr line (warnings / info) — printed above the progress bar.
         Stderr(String),
     }
 
@@ -133,10 +157,31 @@ pub fn extract(
         }
     });
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.green.bold} Extracting  {msg:.dim}").unwrap(),
-    );
+    // Build either a determinate bar (known total) or a spinner (unknown total).
+    let pb = match known_file_count {
+        Some(total) => {
+            let pb = ProgressBar::new(total);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green.bold} Files [{bar:40.green/white.dim}] \
+                     {pos}/{len}  {msg:.dim}",
+                )
+                .unwrap()
+                .progress_chars("█▇▆▅▄▃▂ "),
+            );
+            pb
+        }
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green.bold} Extracting  {pos} files  {msg:.dim}",
+                )
+                .unwrap(),
+            );
+            pb
+        }
+    };
     pb.enable_steady_tick(Duration::from_millis(100));
 
     for event in rx {
@@ -154,7 +199,10 @@ pub fn extract(
         match event {
             Event::Filename(name) => {
                 let display = name.trim().trim_start_matches('-').trim();
-                pb.set_message(display.to_owned());
+                if !display.is_empty() {
+                    pb.set_message(display.to_owned());
+                    pb.inc(1);
+                }
             }
             Event::Stderr(line) => {
                 pb.println(&line);
@@ -181,7 +229,13 @@ pub fn extract(
         anyhow::bail!("innoextract exited with status {code}");
     }
 
+    let file_count = pb.position();
     pb.finish_with_message("done");
+    println!(
+        "\n  {} files  in {:.1}s",
+        file_count,
+        extraction_start.elapsed().as_secs_f64()
+    );
     Ok(true)
 }
 
@@ -247,6 +301,27 @@ pub fn extract_gui(
         resolved_output_dir.display()
     )));
 
+    // Pre-scan the file list so the GUI has a denominator for the file progress
+    // bar. innoextract --list is fast (reads headers only, no decompression).
+    // If it fails for any reason we fall back to an indeterminate display.
+    let known_file_count: Option<u64> = list_lines(input_file)
+        .ok()
+        .map(|lines| {
+            // Count only lines that look like extracted files ("  - path/to/file").
+            lines
+                .iter()
+                .filter(|l| l.trim_start().starts_with('-'))
+                .count() as u64
+        })
+        .filter(|&n| n > 0);
+
+    let _ = tx.send(GuiEvent::Log(format!(
+        "Detected {} file(s) to extract.",
+        known_file_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown number of".to_owned())
+    )));
+
     let mut child = std::process::Command::new("innoextract")
         .arg("--output-dir")
         .arg(&resolved_output_dir)
@@ -283,10 +358,8 @@ pub fn extract_gui(
         }
     });
 
-    // Count files by scanning stdout lines so the Done event carries real stats.
-    // innoextract prints one "  - <path>" line per extracted file.
     let extraction_start = std::time::Instant::now();
-    let mut file_count: usize = 0;
+    let mut file_count: u64 = 0;
 
     for event in erx {
         if !running.load(Ordering::Relaxed) {
@@ -301,10 +374,19 @@ pub fn extract_gui(
 
         match event {
             Event::Filename(name) => {
+                // innoextract stdout lines: "  - path/to/file"
                 let display = name.trim().trim_start_matches('-').trim().to_owned();
                 if !display.is_empty() {
                     file_count += 1;
                     let _ = tx.send(GuiEvent::Filename(display));
+                    // Emit a progress tick so the GUI file bar advances even
+                    // though innoextract doesn't expose byte totals. bytes_*
+                    // fields are left as 0 so the GUI omits the byte bar for
+                    // Inno extractions (files_total == 0 means indeterminate).
+                    let _ = tx.send(GuiEvent::Progress {
+                        files_done: file_count,
+                        files_total: known_file_count.unwrap_or(0),
+                    });
                 }
             }
             Event::Stderr(line) => {
@@ -331,9 +413,7 @@ pub fn extract_gui(
     let elapsed = extraction_start.elapsed().as_secs_f64();
     let _ = tx.send(GuiEvent::Done {
         elapsed_secs: elapsed,
-        // innoextract doesn't expose byte totals; report what we have.
-        total_mib: 0.0,
-        file_count,
+        file_count: file_count as usize,
     });
     Ok(true)
 }
