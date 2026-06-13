@@ -275,9 +275,33 @@ impl App {
                     .to_string_lossy()
                     .into_owned();
                 self.installer_path_str = path.to_string_lossy().into_owned();
-                self.detected_kind = "Unknown".to_owned();
+
+                self.detect_installer();
             }
         }
+    }
+    fn detect_installer(&mut self) {
+        use std::fs::File;
+
+        let path = PathBuf::from(&self.installer_path_str);
+
+        if !path.is_file() {
+            self.detected_kind = "Unknown".to_owned();
+            return;
+        }
+
+        let detected = (|| -> anyhow::Result<&'static str> {
+            let file = File::open(&path)?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            let mmap = crate::mojo::ArcMmap(std::sync::Arc::new(mmap));
+
+            match crate::detect_installer_kind(&mmap)? {
+                crate::InstallerKind::Inno => Ok("Inno Setup"),
+                crate::InstallerKind::MojoSetup => Ok("MojoSetup"),
+            }
+        })();
+
+        self.detected_kind = detected.unwrap_or("Unknown").to_owned();
     }
 }
 
@@ -350,17 +374,32 @@ impl eframe::App for App {
                                 self.output_dir_str = crate::default_output_dir(&path)
                                     .to_string_lossy()
                                     .into_owned();
-                                self.detected_kind = "Unknown".to_owned();
+
+                                self.detect_installer();
                             }
                         }
 
                         // Textbox width takes up the rest of the layout space
                         let edit_width = ui.available_width();
-                        ui.add(
+                        let response = ui.add(
                             egui::TextEdit::singleline(&mut self.installer_path_str)
                                 .hint_text("/path/to/installer.sh")
                                 .desired_width(edit_width),
                         );
+
+                        if response.lost_focus() && response.changed() {
+                            self.detect_installer();
+
+                            if !self.installer_path_str.trim().is_empty() {
+                                let path = PathBuf::from(&self.installer_path_str);
+
+                                if path.exists() {
+                                    self.output_dir_str = crate::default_output_dir(&path)
+                                        .to_string_lossy()
+                                        .into_owned();
+                                }
+                            }
+                        }
                         ui.end_row();
 
                         // --- ROW 2: Output Dir Entry ---
@@ -432,13 +471,13 @@ impl eframe::App for App {
                         RichText::new(&self.detected_kind)
                             .monospace()
                             .strong()
-                            .color(if self.detected_kind.contains("MojoSetup") {
+                            .color(if self.detected_kind == "MojoSetup" {
                                 if is_dark {
                                     Color32::from_rgb(189, 147, 249)
                                 } else {
                                     Color32::from_rgb(52, 90, 182)
                                 }
-                            } else if self.detected_kind.contains("Inno") {
+                            } else if self.detected_kind == "Inno Setup" {
                                 if is_dark {
                                     Color32::from_rgb(139, 233, 253)
                                 } else {
