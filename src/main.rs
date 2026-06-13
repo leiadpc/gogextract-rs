@@ -149,7 +149,18 @@ pub fn installer_worker_loop(
 // Runner logic
 // ---------------------------------------------------------------------------
 
-fn run() -> Result<bool> {
+// Returned by run() to tell main() how to print the final status line.
+enum RunOutcome {
+    /// CLI extraction finished successfully — print the completion banner.
+    CliSuccess,
+    /// CLI extraction was cancelled — print the cancellation notice.
+    CliCancelled,
+    /// GUI exited cleanly — no banner needed.
+    #[cfg(feature = "gui")]
+    GuiExited,
+}
+
+fn run() -> Result<RunOutcome> {
     let args = Args::parse();
 
     #[cfg(feature = "gui")]
@@ -159,7 +170,7 @@ fn run() -> Result<bool> {
             args.input_file.is_none() && args.output_dir.is_none() && !args.force && !args.list;
 
         if force_gui || no_args {
-            gui::run().map(|()| true)
+            gui::run().map(|()| RunOutcome::GuiExited)
         } else {
             run_cli(args)
         }
@@ -171,7 +182,7 @@ fn run() -> Result<bool> {
     }
 }
 
-fn run_cli(args: Args) -> Result<bool> {
+fn run_cli(args: Args) -> Result<RunOutcome> {
     let Some(input_file) = args.input_file else {
         anyhow::bail!("No input file provided. Use --help for usage details.");
     };
@@ -179,8 +190,14 @@ fn run_cli(args: Args) -> Result<bool> {
     let file = File::open(&input_file)
         .with_context(|| format!("Failed to open installer file: {}", input_file.display()))?;
 
-    if cfg!(target_pointer_width = "32") && file.metadata()?.len() > u32::MAX as u64 {
-        anyhow::bail!("File is too large to memory-map on a 32-bit architecture.");
+    // On 32-bit targets, the usable virtual address space is typically 2–3 GiB,
+    // so even files well under 4 GiB can fail to map. Warn early rather than
+    // letting the OS reject the mmap call with a cryptic error.
+    if cfg!(target_pointer_width = "32") && file.metadata()?.len() > 2u64 * 1024 * 1024 * 1024 {
+        anyhow::bail!(
+            "File may be too large to memory-map on a 32-bit architecture \
+             (usable address space is typically ~2–3 GiB)."
+        );
     }
 
     let raw_mmap = unsafe { memmap2::Mmap::map(&file).context("Failed to memory-map file")? };
@@ -200,7 +217,7 @@ fn run_cli(args: Args) -> Result<bool> {
         })?;
     }
 
-    match installer_kind {
+    let ok = match installer_kind {
         InstallerKind::Inno => {
             if args.list {
                 inno::list(&input_file)
@@ -222,21 +239,27 @@ fn run_cli(args: Args) -> Result<bool> {
                 )
             }
         }
+    }?;
+
+    if ok {
+        Ok(RunOutcome::CliSuccess)
+    } else {
+        Ok(RunOutcome::CliCancelled)
     }
 }
 
 fn main() {
     match run() {
-        Ok(true) => {
-            #[cfg(feature = "gui")]
-            if std::env::args().any(|a| a == "--gui" || a == "-g") || std::env::args().len() == 1 {
-                return;
-            }
+        Ok(RunOutcome::CliSuccess) => {
             println!("\n🎉 Extraction complete!");
         }
-        Ok(false) => {
+        Ok(RunOutcome::CliCancelled) => {
             println!("\n🚨 Cancelled — cleaned up.");
             std::process::exit(130);
+        }
+        #[cfg(feature = "gui")]
+        Ok(RunOutcome::GuiExited) => {
+            // GUI handles its own feedback; no console output needed.
         }
         Err(e) => {
             eprintln!("\n❌ Extraction failed: {e:#}");
