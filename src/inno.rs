@@ -8,6 +8,28 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
+// ---------------------------------------------------------------------------
+// Windows: suppress the console window that would otherwise appear when
+// spawning innoextract from a GUI (windowless) process.
+// ---------------------------------------------------------------------------
+
+trait NoConsoleWindow {
+    fn no_console_window(&mut self) -> &mut Self;
+}
+
+impl NoConsoleWindow for std::process::Command {
+    fn no_console_window(&mut self) -> &mut Self {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW (0x08000000) prevents Windows from allocating a
+            // new console for the child process when the parent has none.
+            self.creation_flags(0x08000000);
+        }
+        self
+    }
+}
+
 use crate::mojo::ensure_output_path_available;
 
 pub fn list_lines(input_file: &std::path::Path) -> Result<Vec<String>> {
@@ -31,7 +53,6 @@ pub fn list_lines(input_file: &std::path::Path) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-// Update the existing list() to delegate:
 pub fn list(input_file: &std::path::Path) -> Result<bool> {
     probe_innoextract()?;
     for line in list_lines(input_file)? {
@@ -48,22 +69,10 @@ pub fn extract(
 ) -> Result<bool> {
     probe_innoextract()?;
 
-    // Resolve output directory.
-    let resolved_output_dir = output_dir.unwrap_or_else(|| {
-        let base = input_file
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        base.join(
-            input_file
-                .file_stem()
-                .unwrap_or_else(|| std::ffi::OsStr::new("extracted_game_data")),
-        )
-    });
+    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
 
     ensure_output_path_available(&resolved_output_dir, force)?;
 
-    // If --force, remove the existing directory first so innoextract starts clean.
     if force && resolved_output_dir.exists() {
         fs::remove_dir_all(&resolved_output_dir).with_context(|| {
             format!(
@@ -84,24 +93,21 @@ pub fn extract(
     println!("Extracting to: {}\n", resolved_output_dir.display());
     println!("Press Ctrl+C to cancel.\n");
 
-    // Spawn innoextract.  --output-dir puts files directly where we want them.
     let mut child = std::process::Command::new("innoextract")
         .arg("--output-dir")
         .arg(&resolved_output_dir)
         .arg(input_file)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .no_console_window()
         .spawn()
         .context("Failed to spawn innoextract")?;
 
     let child_stdout = child.stdout.take().expect("stdout piped");
     let child_stderr = child.stderr.take().expect("stderr piped");
 
-    // -------------------------------------------------------------------------
     // Both stdout and stderr are pumped into a single mpsc channel so the main
     // thread can drive the spinner and poll cancellation without select().
-    // -------------------------------------------------------------------------
-
     enum Event {
         /// A filename line from stdout — shown as the spinner message.
         Filename(String),
@@ -111,7 +117,6 @@ pub fn extract(
 
     let (tx, rx) = mpsc::channel::<Event>();
 
-    // Stdout thread: newline-delimited, BufReader::lines() is fine.
     let tx_out = tx.clone();
     let stdout_thread = std::thread::spawn(move || {
         let reader = BufReader::new(child_stdout);
@@ -120,7 +125,6 @@ pub fn extract(
         }
     });
 
-    // Stderr thread: forward all lines as Stderr events.
     let tx_err = tx;
     let stderr_thread = std::thread::spawn(move || {
         let reader = BufReader::new(child_stderr);
@@ -128,10 +132,6 @@ pub fn extract(
             let _ = tx_err.send(Event::Stderr(line));
         }
     });
-
-    // -------------------------------------------------------------------------
-    // Spinner — ticks independently; message shows the current filename.
-    // -------------------------------------------------------------------------
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -153,12 +153,10 @@ pub fn extract(
 
         match event {
             Event::Filename(name) => {
-                // Trim innoextract's leading "  - " decoration if present.
                 let display = name.trim().trim_start_matches('-').trim();
                 pb.set_message(display.to_owned());
             }
             Event::Stderr(line) => {
-                // Warnings/info: print above the spinner without disturbing it.
                 pb.println(&line);
             }
         }
@@ -170,11 +168,9 @@ pub fn extract(
     let status = child.wait().context("Failed to wait for innoextract")?;
     if !status.success() {
         // On Windows, Ctrl-C causes innoextract to exit with STATUS_CONTROL_C_EXIT
-        // (0xC000013A = -1073741510) before our kill() even fires.  Treat it as
-        // a clean cancellation rather than an error.  Also catch the case where
-        // the running flag was cleared (Ctrl-C raced with the last event).
+        // (0xC000013A = -1073741510) before our kill() even fires.
         let code = status.code().unwrap_or(0) as i32;
-        if code == -1073741510i32 || !running.load(std::sync::atomic::Ordering::Relaxed) {
+        if code == -1073741510i32 || !running.load(Ordering::Relaxed) {
             pb.abandon_with_message("cancelled");
             if resolved_output_dir.exists() {
                 let _ = fs::remove_dir_all(&resolved_output_dir);
@@ -194,10 +190,12 @@ pub fn extract(
 // ---------------------------------------------------------------------------
 
 fn probe_innoextract() -> Result<()> {
-    let probe = std::process::Command::new("innoextract")
+    let ok = std::process::Command::new("innoextract")
         .arg("--version")
-        .output();
-    if probe.is_err() || !probe.unwrap().status.success() {
+        .no_console_window()
+        .output()
+        .map_or(false, |o| o.status.success());
+    if !ok {
         anyhow::bail!(
             "innoextract not found on PATH.\n\
              Install it (e.g. `apt install innoextract`, `brew install innoextract`, \
@@ -206,9 +204,14 @@ fn probe_innoextract() -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// GUI extraction path
+// ---------------------------------------------------------------------------
+
 #[cfg(feature = "gui")]
 use crate::gui::GuiEvent;
-#[cfg(feature = "gui")]
+
 #[cfg(feature = "gui")]
 pub fn extract_gui(
     input_file: &std::path::Path,
@@ -219,17 +222,7 @@ pub fn extract_gui(
 ) -> Result<bool> {
     probe_innoextract()?;
 
-    let resolved_output_dir = output_dir.unwrap_or_else(|| {
-        let base = input_file
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        base.join(
-            input_file
-                .file_stem()
-                .unwrap_or_else(|| std::ffi::OsStr::new("extracted_game_data")),
-        )
-    });
+    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
 
     ensure_output_path_available(&resolved_output_dir, force)?;
 
@@ -260,6 +253,7 @@ pub fn extract_gui(
         .arg(input_file)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .no_console_window()
         .spawn()
         .context("Failed to spawn innoextract")?;
 
@@ -289,7 +283,10 @@ pub fn extract_gui(
         }
     });
 
-    let start = std::time::Instant::now();
+    // Count files by scanning stdout lines so the Done event carries real stats.
+    // innoextract prints one "  - <path>" line per extracted file.
+    let extraction_start = std::time::Instant::now();
+    let mut file_count: usize = 0;
 
     for event in erx {
         if !running.load(Ordering::Relaxed) {
@@ -306,6 +303,7 @@ pub fn extract_gui(
             Event::Filename(name) => {
                 let display = name.trim().trim_start_matches('-').trim().to_owned();
                 if !display.is_empty() {
+                    file_count += 1;
                     let _ = tx.send(GuiEvent::Filename(display));
                 }
             }
@@ -330,11 +328,12 @@ pub fn extract_gui(
         anyhow::bail!("innoextract exited with status {code}");
     }
 
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = extraction_start.elapsed().as_secs_f64();
     let _ = tx.send(GuiEvent::Done {
         elapsed_secs: elapsed,
-        total_mib: 0.0, // innoextract doesn't expose byte totals easily
-        file_count: 0,
+        // innoextract doesn't expose byte totals; report what we have.
+        total_mib: 0.0,
+        file_count,
     });
     Ok(true)
 }
