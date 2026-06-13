@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Cursor, Read, Write};
@@ -14,8 +14,10 @@ use std::os::unix::fs::PermissionsExt;
 
 pub const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
-// How many bytes to decompress between cancellation polls.
-const CANCEL_CHECK_INTERVAL_BYTES: usize = 1024 * 1024; // 1 MB
+// How many bytes to decompress between cancellation polls. Kept at 256 KiB so
+// that cancellation feels snappy even on archives with very large single files,
+// while the atomic load overhead remains negligible compared to I/O cost.
+const CANCEL_CHECK_INTERVAL_BYTES: usize = 256 * 1024;
 
 // Minimum wall-clock time between progress-bar filename updates.
 const PROGRESS_MSG_INTERVAL: Duration = Duration::from_millis(100);
@@ -168,32 +170,20 @@ pub fn ensure_output_path_available(path: &Path, force: bool) -> Result<()> {
 }
 
 fn create_staging_dir(output_dir: &Path) -> Result<PathBuf> {
+    // PID + millisecond timestamp gives a unique-enough name without retrying.
+    // Two processes would need the same PID and start within the same millisecond
+    // in the same directory to collide — effectively impossible in practice.
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
 
-    for attempt in 0..100 {
-        let path = output_dir.join(format!(
-            ".gogextract-tmp-{}-{}-{}",
-            process::id(),
-            timestamp,
-            attempt
-        ));
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Failed to create staging directory {}", path.display())
-                })
-            }
-        }
-    }
-    anyhow::bail!(
-        "Failed to create a unique staging directory under {}",
-        output_dir.display()
-    );
+    let path = output_dir.join(format!(".gogextract-tmp-{}-{}", process::id(), timestamp,));
+
+    fs::create_dir(&path)
+        .with_context(|| format!("Failed to create staging directory {}", path.display()))?;
+
+    Ok(path)
 }
 
 pub fn finalize_output(layout: &OutputLayout) -> Result<()> {
@@ -233,7 +223,10 @@ pub fn finalize_output(layout: &OutputLayout) -> Result<()> {
         })?;
     }
 
-    fs::remove_dir(&layout.staging_dir).with_context(|| {
+    // Use remove_dir_all rather than remove_dir: if the archive contained loose
+    // files outside game_data/ they would remain in the staging dir and cause
+    // remove_dir to fail with ENOTEMPTY.
+    fs::remove_dir_all(&layout.staging_dir).with_context(|| {
         format!(
             "Failed to remove staging directory {}",
             layout.staging_dir.display()
@@ -256,15 +249,7 @@ fn remove_existing_output_path(path: &Path) -> io::Result<()> {
 
 fn file_count_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{spinner:.magenta.bold} Files    [{bar:40.magenta/purple.dim}] {pos}/{len}  {msg:.dim}",
-    )
-    .unwrap()
-    .progress_chars("█▇▆▅▄▃▂ ")
-}
-
-fn byte_progress_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{spinner:.cyan.bold}   Bytes   [{bar:40.cyan/blue.dim}] {bytes}/{total_bytes}  ({bytes_per_sec})",
+        "{spinner:.green.bold} Files [{bar:40.green/white.dim}] {pos}/{len}  {msg:.dim}",
     )
     .unwrap()
     .progress_chars("█▇▆▅▄▃▂ ")
@@ -330,25 +315,31 @@ pub fn list(mmap: &ArcMmap) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Parallel ZIP extraction — helper that scans metadata in one parallel pass.
-// Returns (file_count, total_uncompressed_bytes), skipping directory entries.
+// ZIP metadata scan — single-threaded sequential pass over the central
+// directory. ZipArchive::new() has already parsed the central directory into
+// memory, so by_index() here only reads metadata fields without seeking to
+// the compressed data. Running this in parallel would spawn N ZipArchive
+// instances, each re-parsing the central directory, which is slower for large
+// entry counts and wastes memory.
 // ---------------------------------------------------------------------------
 
-fn scan_zip_metadata(mmap: &ArcMmap, count: usize) -> (usize, u64) {
-    (0..count)
-        .into_par_iter()
-        .map_with(Cursor::new(mmap.clone()), |cursor, i| {
-            if let Ok(mut archive) = zip::ZipArchive::new(cursor) {
-                if let Ok(entry) = archive.by_index(i) {
-                    if !entry.is_dir() {
-                        return (1usize, entry.size());
-                    }
-                }
+fn scan_zip_metadata(mmap: &ArcMmap, count: usize) -> usize {
+    let cursor = Cursor::new(mmap.clone());
+    let mut archive = match zip::ZipArchive::new(cursor) {
+        Ok(a) => a,
+        Err(_) => return 0,
+    };
+
+    let mut file_count = 0usize;
+    for i in 0..count {
+        if let Ok(entry) = archive.by_index_raw(i) {
+            if !entry.is_dir() {
+                file_count += 1;
             }
-            // Directory entries and failed reads contribute nothing.
-            (0, 0)
-        })
-        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        }
+    }
+
+    file_count
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +360,7 @@ pub fn extract(
         .context("Failed to open ZIP archive")?
         .len();
 
-    let (total_files, total_bytes) = scan_zip_metadata(mmap, count);
+    let total_files = scan_zip_metadata(mmap, count);
 
     let layout = prepare_output_layout(&resolved_output_dir, force)?;
     let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
@@ -384,16 +375,12 @@ pub fn extract(
         )
     })?;
 
-    let multi = MultiProgress::new();
-    let pb_files = multi.add(ProgressBar::new(total_files as u64));
+    let pb_files = ProgressBar::new(total_files as u64);
     pb_files.set_style(file_count_style());
-
-    let pb_bytes = multi.add(ProgressBar::new(total_bytes));
-    pb_bytes.set_style(byte_progress_style());
+    pb_files.enable_steady_tick(Duration::from_millis(100));
 
     let extraction_start = Instant::now();
     let last_msg_nanos = Arc::new(AtomicU64::new(0));
-    let bytes_extracted = Arc::new(AtomicU64::new(0));
 
     let extract_result = (0..count).into_par_iter().try_for_each_init(
         || {
@@ -415,6 +402,8 @@ pub fn extract(
 
             let entry_name = zip_file.name().to_owned();
             let Some(path) = zip_file.enclosed_name() else {
+                // innoextract prints "  - path/to/file" (leading spaces + dash); we
+                // strip the dash prefix so the spinner shows a clean filename.
                 eprintln!("Warning: skipping unsafe path in ZIP: {entry_name:?}");
                 pb_files.inc(1);
                 return Ok(());
@@ -437,7 +426,7 @@ pub fn extract(
                 let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, outfile);
                 let mut reader = CancellableReader::new(&mut zip_file, running);
 
-                let written = io::copy(&mut reader, &mut writer)
+                let _written = io::copy(&mut reader, &mut writer)
                     .with_context(|| format!("Failed to write {entry_name}"))?;
 
                 writer
@@ -464,10 +453,6 @@ pub fn extract(
                         pb_files.set_message(name.to_owned());
                     }
                 }
-
-                let current_total_bytes =
-                    bytes_extracted.fetch_add(written, Ordering::Relaxed) + written;
-                pb_bytes.set_position(current_total_bytes);
             }
 
             pb_files.inc(1);
@@ -484,27 +469,23 @@ pub fn extract(
                 || user_cancelled.load(Ordering::Relaxed) =>
         {
             pb_files.abandon_with_message("cancelled");
-            pb_bytes.abandon_with_message("cancelled");
             drop(staging_cleanup);
-            let _ = fs::remove_dir(&resolved_output_dir);
+            let _ = fs::remove_dir_all(&resolved_output_dir);
             return Ok(false);
         }
         Err(e) => return Err(e),
     }
 
     pb_files.finish_with_message("done");
-    pb_bytes.finish_with_message("done");
 
     finalize_output(&layout)?;
     staging_cleanup.disarm();
 
     let elapsed = extraction_start.elapsed();
-    let total_mib = total_bytes as f64 / (1024.0 * 1024.0);
     println!(
-        "\n  {} files  {:.1} MiB  in {:.1}s",
+        "\n  {} files  in {:.1}s",
         total_files,
-        total_mib,
-        elapsed.as_secs_f64(),
+        elapsed.as_secs_f64()
     );
 
     Ok(true)
@@ -535,7 +516,7 @@ pub fn extract_gui(
         .context("Failed to open ZIP archive")?
         .len();
 
-    let (total_files, total_bytes) = scan_zip_metadata(mmap, count);
+    let total_files = scan_zip_metadata(mmap, count);
 
     let layout = prepare_output_layout(&resolved_output_dir, force)?;
     let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
@@ -554,7 +535,6 @@ pub fn extract_gui(
 
     let extraction_start = Instant::now();
     let last_msg_nanos = Arc::new(AtomicU64::new(0));
-    let bytes_extracted = Arc::new(AtomicU64::new(0));
     let files_extracted = Arc::new(AtomicU64::new(0));
 
     let tx = Arc::new(tx.clone());
@@ -602,7 +582,7 @@ pub fn extract_gui(
                 let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, outfile);
                 let mut reader = CancellableReader::new(&mut zip_file, running);
 
-                let written = io::copy(&mut reader, &mut writer)
+                let _written = io::copy(&mut reader, &mut writer)
                     .with_context(|| format!("Failed to write {entry_name}"))?;
 
                 writer
@@ -616,7 +596,6 @@ pub fn extract_gui(
                     )?;
                 }
 
-                let bd = bytes_extracted.fetch_add(written, Ordering::Relaxed) + written;
                 let fd = files_extracted.fetch_add(1, Ordering::Relaxed) + 1;
 
                 // UI event throttling to prevent channel congestion.
@@ -634,8 +613,6 @@ pub fn extract_gui(
                     let _ = tx.send(GuiEvent::Progress {
                         files_done: fd,
                         files_total: total_files as u64,
-                        bytes_done: bd,
-                        bytes_total: total_bytes,
                     });
                 }
             }
@@ -652,7 +629,7 @@ pub fn extract_gui(
                 || user_cancelled.load(Ordering::Relaxed) =>
         {
             drop(staging_cleanup);
-            let _ = fs::remove_dir(&resolved_output_dir);
+            let _ = fs::remove_dir_all(&resolved_output_dir);
             return Ok(false);
         }
         Err(e) => return Err(e),
@@ -662,18 +639,14 @@ pub fn extract_gui(
     let _ = tx.send(GuiEvent::Progress {
         files_done: total_files as u64,
         files_total: total_files as u64,
-        bytes_done: total_bytes,
-        bytes_total: total_bytes,
     });
 
     finalize_output(&layout)?;
     staging_cleanup.disarm();
 
     let elapsed = extraction_start.elapsed().as_secs_f64();
-    let total_mib = total_bytes as f64 / (1024.0 * 1024.0);
     let _ = tx.send(GuiEvent::Done {
         elapsed_secs: elapsed,
-        total_mib,
         file_count: total_files,
     });
     Ok(true)
