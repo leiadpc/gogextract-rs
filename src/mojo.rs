@@ -88,7 +88,12 @@ impl<'a, R: Read> Read for CancellableReader<'a, R> {
         }
 
         let n = self.inner.read(out)?;
-        self.bytes_since_check += n;
+        // Only accumulate actual bytes — zero-length reads (EOF probes) must
+        // not advance the counter, otherwise the threshold can be hit on an
+        // empty stream and fire a spurious cancellation check.
+        if n > 0 {
+            self.bytes_since_check += n;
+        }
         Ok(n)
     }
 }
@@ -315,23 +320,31 @@ pub fn list(mmap: &ArcMmap) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// ZIP metadata scan — single-threaded sequential pass over the central
-// directory. ZipArchive::new() has already parsed the central directory into
-// memory, so by_index() here only reads metadata fields without seeking to
-// the compressed data. Running this in parallel would spawn N ZipArchive
+// ZIP metadata scan
+//
+// Opens the archive once and returns both the raw entry count (directories
+// included, needed to drive the Rayon index range) and the file-only count
+// (used as the progress bar total). ZipArchive::new() parses the central
+// directory into memory so by_index_raw() here is metadata-only — no seeking
+// to compressed data. Running this in parallel would spawn N ZipArchive
 // instances, each re-parsing the central directory, which is slower for large
 // entry counts and wastes memory.
 // ---------------------------------------------------------------------------
 
-fn scan_zip_metadata(mmap: &ArcMmap, count: usize) -> usize {
-    let cursor = Cursor::new(mmap.clone());
-    let mut archive = match zip::ZipArchive::new(cursor) {
-        Ok(a) => a,
-        Err(_) => return 0,
-    };
+pub struct ZipCounts {
+    /// Total entries including directories — used as the Rayon iteration bound.
+    pub entry_count: usize,
+    /// Files only (no directories) — used as the progress bar total.
+    pub file_count: usize,
+}
 
+fn scan_zip_counts(mmap: &ArcMmap) -> Result<ZipCounts> {
+    let cursor = Cursor::new(mmap.clone());
+    let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
+
+    let entry_count = archive.len();
     let mut file_count = 0usize;
-    for i in 0..count {
+    for i in 0..entry_count {
         if let Ok(entry) = archive.by_index_raw(i) {
             if !entry.is_dir() {
                 file_count += 1;
@@ -339,7 +352,10 @@ fn scan_zip_metadata(mmap: &ArcMmap, count: usize) -> usize {
         }
     }
 
-    file_count
+    Ok(ZipCounts {
+        entry_count,
+        file_count,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -356,11 +372,7 @@ pub fn extract(
 ) -> Result<bool> {
     let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
 
-    let count = zip::ZipArchive::new(Cursor::new(mmap.clone()))
-        .context("Failed to open ZIP archive")?
-        .len();
-
-    let total_files = scan_zip_metadata(mmap, count);
+    let counts = scan_zip_counts(mmap)?;
 
     let layout = prepare_output_layout(&resolved_output_dir, force)?;
     let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
@@ -375,14 +387,14 @@ pub fn extract(
         )
     })?;
 
-    let pb_files = ProgressBar::new(total_files as u64);
+    let pb_files = ProgressBar::new(counts.file_count as u64);
     pb_files.set_style(file_count_style());
     pb_files.enable_steady_tick(Duration::from_millis(100));
 
     let extraction_start = Instant::now();
     let last_msg_nanos = Arc::new(AtomicU64::new(0));
 
-    let extract_result = (0..count).into_par_iter().try_for_each_init(
+    let extract_result = (0..counts.entry_count).into_par_iter().try_for_each_init(
         || {
             let cursor = Cursor::new(mmap.clone());
             zip::ZipArchive::new(cursor).context("Failed to open ZIP archive for worker")
@@ -402,10 +414,10 @@ pub fn extract(
 
             let entry_name = zip_file.name().to_owned();
             let Some(path) = zip_file.enclosed_name() else {
-                // innoextract prints "  - path/to/file" (leading spaces + dash); we
-                // strip the dash prefix so the spinner shows a clean filename.
+                // Skip entries with unsafe paths (e.g. path traversal) without
+                // incrementing the progress bar — the file count total was
+                // computed from safe entries only.
                 eprintln!("Warning: skipping unsafe path in ZIP: {entry_name:?}");
-                pb_files.inc(1);
                 return Ok(());
             };
             let outpath = layout.staging_game_dir.join(&path);
@@ -453,9 +465,10 @@ pub fn extract(
                         pb_files.set_message(name.to_owned());
                     }
                 }
+
+                pb_files.inc(1);
             }
 
-            pb_files.inc(1);
             Ok(())
         },
     );
@@ -484,7 +497,7 @@ pub fn extract(
     let elapsed = extraction_start.elapsed();
     println!(
         "\n  {} files  in {:.1}s",
-        total_files,
+        counts.file_count,
         elapsed.as_secs_f64()
     );
 
@@ -512,11 +525,7 @@ pub fn extract_gui(
 ) -> Result<bool> {
     let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
 
-    let count = zip::ZipArchive::new(Cursor::new(mmap.clone()))
-        .context("Failed to open ZIP archive")?
-        .len();
-
-    let total_files = scan_zip_metadata(mmap, count);
+    let counts = scan_zip_counts(mmap)?;
 
     let layout = prepare_output_layout(&resolved_output_dir, force)?;
     let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
@@ -539,7 +548,7 @@ pub fn extract_gui(
 
     let tx = Arc::new(tx.clone());
 
-    let extract_result = (0..count).into_par_iter().try_for_each_init(
+    let extract_result = (0..counts.entry_count).into_par_iter().try_for_each_init(
         || {
             let cursor = std::io::Cursor::new(mmap.clone());
             zip::ZipArchive::new(cursor).context("Failed to open ZIP archive for worker")
@@ -607,12 +616,13 @@ pub fn extract_gui(
                         .compare_exchange(last_ns, now_ns, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                 {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        let _ = tx.send(GuiEvent::Filename(name.to_owned()));
-                    }
+                    // Emit filename + progress atomically in one event so the
+                    // GUI fields never become out of sync.
+                    let current_file = path.file_name().and_then(|n| n.to_str()).map(str::to_owned);
                     let _ = tx.send(GuiEvent::Progress {
                         files_done: fd,
-                        files_total: total_files as u64,
+                        files_total: counts.file_count as u64,
+                        current_file,
                     });
                 }
             }
@@ -628,8 +638,18 @@ pub fn extract_gui(
             if e.downcast_ref::<Cancelled>().is_some()
                 || user_cancelled.load(Ordering::Relaxed) =>
         {
+            // Drop the RAII guard first to clean up the staging dir, then
+            // remove the output root. Do NOT remove resolved_output_dir if a
+            // previous successful extraction already lives there and force was
+            // not set — check whether the staging cleanup still owns the guard.
             drop(staging_cleanup);
-            let _ = fs::remove_dir_all(&resolved_output_dir);
+            // Only remove the output root if it was freshly created by this
+            // run (i.e. it didn't exist before prepare_output_layout was called).
+            // We infer this by checking that the final game dir does not exist
+            // (it was never populated due to cancellation before finalize_output).
+            if !layout.final_game_dir.exists() {
+                let _ = fs::remove_dir_all(&resolved_output_dir);
+            }
             return Ok(false);
         }
         Err(e) => return Err(e),
@@ -637,8 +657,9 @@ pub fn extract_gui(
 
     // Send a final progress tick to ensure the GUI reaches 100%.
     let _ = tx.send(GuiEvent::Progress {
-        files_done: total_files as u64,
-        files_total: total_files as u64,
+        files_done: counts.file_count as u64,
+        files_total: counts.file_count as u64,
+        current_file: None,
     });
 
     finalize_output(&layout)?;
@@ -647,7 +668,8 @@ pub fn extract_gui(
     let elapsed = extraction_start.elapsed().as_secs_f64();
     let _ = tx.send(GuiEvent::Done {
         elapsed_secs: elapsed,
-        file_count: total_files,
+        file_count: counts.file_count,
+        output_dir: resolved_output_dir,
     });
     Ok(true)
 }
