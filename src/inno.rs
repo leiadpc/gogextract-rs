@@ -307,7 +307,6 @@ pub fn extract_gui(
     let known_file_count: Option<u64> = list_lines(input_file)
         .ok()
         .map(|lines| {
-            // Count only lines that look like extracted files ("  - path/to/file").
             lines
                 .iter()
                 .filter(|l| l.trim_start().starts_with('-'))
@@ -369,6 +368,9 @@ pub fn extract_gui(
             if resolved_output_dir.exists() {
                 let _ = fs::remove_dir_all(&resolved_output_dir);
             }
+            // Return Ok(false) — the caller (installer_worker_loop's thread) maps
+            // this to GuiEvent::Cancelled; we don't send it here to keep
+            // the cancellation path consistent with the mojo extract_gui path.
             return Ok(false);
         }
 
@@ -378,14 +380,12 @@ pub fn extract_gui(
                 let display = name.trim().trim_start_matches('-').trim().to_owned();
                 if !display.is_empty() {
                     file_count += 1;
-                    let _ = tx.send(GuiEvent::Filename(display));
-                    // Emit a progress tick so the GUI file bar advances even
-                    // though innoextract doesn't expose byte totals. bytes_*
-                    // fields are left as 0 so the GUI omits the byte bar for
-                    // Inno extractions (files_total == 0 means indeterminate).
+                    // Combine filename + counter into a single Progress event so
+                    // the GUI fields are always in sync (see GuiEvent::Progress).
                     let _ = tx.send(GuiEvent::Progress {
                         files_done: file_count,
                         files_total: known_file_count.unwrap_or(0),
+                        current_file: Some(display),
                     });
                 }
             }
@@ -414,6 +414,7 @@ pub fn extract_gui(
     let _ = tx.send(GuiEvent::Done {
         elapsed_secs: elapsed,
         file_count: file_count as usize,
+        output_dir: resolved_output_dir,
     });
     Ok(true)
 }
