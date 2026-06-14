@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
+use crate::InstallerKind;
+
 // ---------------------------------------------------------------------------
 // Events from the extraction worker to the GUI
 // ---------------------------------------------------------------------------
@@ -11,17 +13,27 @@ use std::sync::{mpsc, Arc};
 #[derive(Debug)]
 pub enum GuiEvent {
     /// Installer type was detected.
-    Detected(String),
-    /// A filename was extracted.
-    Filename(String),
-    /// Extraction progress data.
-    Progress { files_done: u64, files_total: u64 },
+    Detected(InstallerKind),
+    /// A filename was extracted, along with current progress counts.
+    /// Combining these into one event prevents the filename and counter
+    /// from becoming out of sync due to channel-level throttling.
+    Progress {
+        files_done: u64,
+        files_total: u64,
+        /// `None` when the progress tick doesn't carry a new filename (e.g.
+        /// the Inno path emits progress on every file; throttling is done
+        /// inside the worker).
+        current_file: Option<String>,
+    },
     /// A log line (warnings, info).
     Log(String),
     /// Extraction finished successfully.
     Done {
         elapsed_secs: f64,
         file_count: usize,
+        /// The output directory actually used, captured at extraction start
+        /// so it is correct even if the user edits the path field mid-run.
+        output_dir: PathBuf,
     },
     /// Extraction failed.
     Failed(String),
@@ -32,6 +44,8 @@ pub enum GuiEvent {
 // ---------------------------------------------------------------------------
 // GUI state machine
 // ---------------------------------------------------------------------------
+
+const MAX_LOG_LINES: usize = 1000;
 
 #[derive(PartialEq)]
 enum State {
@@ -53,7 +67,8 @@ pub struct App {
     force_overwrite: bool,
 
     // Status text & tracking
-    detected_kind: String,
+    /// `None` = not yet detected / unknown; avoids fragile string comparisons.
+    detected_kind: Option<InstallerKind>,
     current_file: String,
     files_done: u64,
     files_total: u64,
@@ -79,7 +94,7 @@ impl App {
             output_dir_str: String::new(),
             last_output_dir: None,
             force_overwrite: false,
-            detected_kind: "Unknown".to_owned(),
+            detected_kind: None,
             current_file: String::new(),
             files_done: 0,
             files_total: 0,
@@ -94,30 +109,39 @@ impl App {
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
-        if self.state != State::Running && self.state != State::Cancelling {
-            return;
-        }
-
         let mut repainted = false;
 
         while let Ok(event) = self.rx.try_recv() {
+            // GuiEvent::Detected is emitted by the background detection thread
+            // and must be processed in any state so the installer profile label
+            // updates as soon as a file is loaded, before extraction starts.
+            if let GuiEvent::Detected(kind) = event {
+                self.detected_kind = Some(kind);
+                repainted = true;
+                continue;
+            }
+
+            // All other events are only meaningful while a worker is active.
+            if self.state != State::Running && self.state != State::Cancelling {
+                continue;
+            }
+
             repainted = true;
             match event {
-                GuiEvent::Detected(kind) => {
-                    self.detected_kind = kind;
-                }
-                GuiEvent::Filename(name) => {
-                    self.current_file = name;
-                }
+                GuiEvent::Detected(_) => unreachable!("handled above"),
                 GuiEvent::Progress {
                     files_done,
                     files_total,
+                    current_file,
                 } => {
                     self.files_done = files_done;
                     self.files_total = files_total;
+                    if let Some(name) = current_file {
+                        self.current_file = name;
+                    }
                 }
                 GuiEvent::Log(line) => {
-                    if self.log.len() >= 1000 {
+                    if self.log.len() >= MAX_LOG_LINES {
                         self.log.pop_front();
                     }
                     self.log.push_back(line);
@@ -125,20 +149,12 @@ impl App {
                 GuiEvent::Done {
                     elapsed_secs,
                     file_count,
+                    output_dir,
                 } => {
                     self.state = State::Done;
-
-                    let out_path = PathBuf::from(&self.output_dir_str);
-                    if !self.output_dir_str.trim().is_empty() {
-                        self.last_output_dir = Some(out_path);
-                    } else if !self.installer_path_str.trim().is_empty() {
-                        self.last_output_dir = Some(crate::default_output_dir(&PathBuf::from(
-                            &self.installer_path_str,
-                        )));
-                    } else {
-                        self.last_output_dir = None;
-                    }
-
+                    // Use the path captured at extraction start — not the
+                    // current field value, which the user may have edited.
+                    self.last_output_dir = Some(output_dir);
                     self.summary_text = format!(
                         "✓ Successfully extracted {} files in {:.1} seconds.",
                         file_count, elapsed_secs
@@ -168,11 +184,18 @@ impl App {
         }
         let input_file = PathBuf::from(&self.installer_path_str);
 
-        let out_dir = if self.output_dir_str.trim().is_empty() {
-            None
+        // Resolve the output dir now, before the worker thread starts, so the
+        // Done event carries the path that was actually used regardless of any
+        // subsequent edits the user makes to the output_dir field.
+        let resolved_output_dir = if self.output_dir_str.trim().is_empty() {
+            crate::default_output_dir(&input_file)
         } else {
-            Some(PathBuf::from(&self.output_dir_str))
+            PathBuf::from(&self.output_dir_str)
         };
+
+        // Pass None to the worker so it doesn't re-derive the path; we already
+        // have the resolved dir and will embed it in the Done event.
+        let out_dir = Some(resolved_output_dir.clone());
 
         self.state = State::Running;
         self.current_file.clear();
@@ -200,6 +223,8 @@ impl App {
                 &tx,
             );
             match res {
+                // extract_gui functions send GuiEvent::Done themselves, so
+                // Ok(true) has already been communicated to the GUI.
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = tx.send(GuiEvent::Cancelled);
@@ -232,7 +257,12 @@ impl App {
         let _ = std::process::Command::new("open").arg(dir).spawn();
 
         #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        {
+            // Prefer $OPENER if set (common on tiling/headless setups), fall
+            // back to xdg-open which is available on most desktop Linux distros.
+            let opener = std::env::var("OPENER").unwrap_or_else(|_| "xdg-open".to_owned());
+            let _ = std::process::Command::new(&opener).arg(dir).spawn();
+        }
     }
 
     fn log_line_color(
@@ -276,32 +306,49 @@ impl App {
                     .into_owned();
                 self.installer_path_str = path.to_string_lossy().into_owned();
 
-                self.detect_installer();
+                self.detect_installer_async(ctx);
             }
         }
     }
-    fn detect_installer(&mut self) {
+
+    /// Spawns a short-lived background thread to detect the installer kind,
+    /// keeping the UI thread responsive on slow or network-mounted paths.
+    /// The result arrives as a `GuiEvent::Detected` on the normal event channel,
+    /// and the thread requests a repaint so `drain_events` picks it up immediately.
+    fn detect_installer_async(&mut self, ctx: &egui::Context) {
         use std::fs::File;
 
         let path = PathBuf::from(&self.installer_path_str);
-
         if !path.is_file() {
-            self.detected_kind = "Unknown".to_owned();
+            self.detected_kind = None;
             return;
         }
 
-        let detected = (|| -> anyhow::Result<&'static str> {
-            let file = File::open(&path)?;
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
-            let mmap = crate::mojo::ArcMmap(std::sync::Arc::new(mmap));
+        // Optimistically clear while we wait for the result.
+        self.detected_kind = None;
 
-            match crate::detect_installer_kind(&mmap)? {
-                crate::InstallerKind::Inno => Ok("Inno Setup"),
-                crate::InstallerKind::MojoSetup => Ok("MojoSetup"),
+        let tx = self.tx.clone();
+        // egui::Context is cheaply cloneable (Arc internally) and Send, so we
+        // can move it into the thread and call request_repaint() after the event
+        // is queued — otherwise the result would sit unseen until the next
+        // user-triggered repaint.
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<InstallerKind> {
+                let file = File::open(&path)?;
+                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+                let mmap = crate::mojo::ArcMmap(Arc::new(mmap));
+                crate::detect_installer_kind(&mmap)
+            })();
+
+            if let Ok(kind) = result {
+                let _ = tx.send(GuiEvent::Detected(kind));
+                // Wake the UI thread so drain_events processes the event
+                // without waiting for the next user interaction.
+                ctx.request_repaint();
             }
-        })();
-
-        self.detected_kind = detected.unwrap_or("Unknown").to_owned();
+            // On failure we leave detected_kind as None (unknown) — no event sent.
+        });
     }
 }
 
@@ -375,7 +422,7 @@ impl eframe::App for App {
                                     .to_string_lossy()
                                     .into_owned();
 
-                                self.detect_installer();
+                                self.detect_installer_async(ctx);
                             }
                         }
 
@@ -388,7 +435,7 @@ impl eframe::App for App {
                         );
 
                         if response.lost_focus() && response.changed() {
-                            self.detect_installer();
+                            self.detect_installer_async(ctx);
 
                             if !self.installer_path_str.trim().is_empty() {
                                 let path = PathBuf::from(&self.installer_path_str);
@@ -467,29 +514,39 @@ impl eframe::App for App {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Color and label derived from typed InstallerKind — no string matching.
+                    let (kind_label, kind_color) = match self.detected_kind {
+                        Some(InstallerKind::MojoSetup) => (
+                            "MojoSetup",
+                            if is_dark {
+                                Color32::from_rgb(189, 147, 249)
+                            } else {
+                                Color32::from_rgb(52, 90, 182)
+                            },
+                        ),
+                        Some(InstallerKind::Inno) => (
+                            "Inno Setup",
+                            if is_dark {
+                                Color32::from_rgb(139, 233, 253)
+                            } else {
+                                Color32::from_rgb(181, 137, 0)
+                            },
+                        ),
+                        None => (
+                            "Unknown",
+                            if is_dark {
+                                Color32::from_gray(140)
+                            } else {
+                                Color32::from_gray(100)
+                            },
+                        ),
+                    };
+
                     ui.label(
-                        RichText::new(&self.detected_kind)
+                        RichText::new(kind_label)
                             .monospace()
                             .strong()
-                            .color(if self.detected_kind == "MojoSetup" {
-                                if is_dark {
-                                    Color32::from_rgb(189, 147, 249)
-                                } else {
-                                    Color32::from_rgb(52, 90, 182)
-                                }
-                            } else if self.detected_kind == "Inno Setup" {
-                                if is_dark {
-                                    Color32::from_rgb(139, 233, 253)
-                                } else {
-                                    Color32::from_rgb(181, 137, 0)
-                                }
-                            } else {
-                                if is_dark {
-                                    Color32::from_gray(140)
-                                } else {
-                                    Color32::from_gray(100)
-                                }
-                            }),
+                            .color(kind_color),
                     );
                     ui.label("Installer Profile:");
                 });
