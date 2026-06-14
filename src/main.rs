@@ -68,15 +68,26 @@ pub enum InstallerKind {
     MojoSetup,
 }
 
+impl std::fmt::Display for InstallerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallerKind::Inno => write!(f, "Inno Setup"),
+            InstallerKind::MojoSetup => write!(f, "MojoSetup"),
+        }
+    }
+}
+
 pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
     let data = mmap.as_ref();
 
     // 1. Check for Inno Setup Windows installer signatures.
     //    Inno data is appended after the PE stub and can sit beyond 1 MiB on
-    //    larger titles, so we scan up to 8 MiB.
+    //    larger titles, so we scan up to 8 MiB (= INNO_SCAN_LIMIT).
     const INNO_MAGIC: &[u8] = b"Inno Setup Setup Data";
-    const SCAN_LIMIT: usize = 8 * 1024 * 1024;
-    let scan_end = data.len().min(SCAN_LIMIT);
+    // Inno magic can appear well past 1 MiB on large titles; 8 MiB covers all
+    // known GOG releases without scanning the entire file.
+    const INNO_SCAN_LIMIT: usize = 8 * 1024 * 1024;
+    let scan_end = data.len().min(INNO_SCAN_LIMIT);
     if data[..scan_end]
         .windows(INNO_MAGIC.len())
         .any(|w| w == INNO_MAGIC)
@@ -86,6 +97,8 @@ pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
 
     // 2. Check for traditional ZIP archives or appended-script ZIP structures (.sh).
     const EOCD_SIG: &[u8] = b"PK\x05\x06";
+    // ZIP spec allows the EOCD record to appear anywhere in the last 65535+22
+    // bytes of the file.
     const MAX_EOCD_SEARCH: usize = 65535 + 22;
     let search_start = data.len().saturating_sub(MAX_EOCD_SEARCH);
 
@@ -125,23 +138,21 @@ pub fn installer_worker_loop(
 
     let kind = detect_installer_kind(&mmap)?;
 
+    // Inform the GUI of the detected type using the shared Display impl so the
+    // string is always consistent with what InstallerKind::fmt produces.
+    let _ = tx.send(gui::GuiEvent::Detected(kind));
+
     match kind {
-        InstallerKind::Inno => {
-            let _ = tx.send(gui::GuiEvent::Detected("Inno Setup".to_owned()));
-            inno::extract_gui(input_file, output_dir, force, running, tx)
-        }
-        InstallerKind::MojoSetup => {
-            let _ = tx.send(gui::GuiEvent::Detected("MojoSetup".to_owned()));
-            mojo::extract_gui(
-                &mmap,
-                input_file,
-                output_dir,
-                force,
-                running,
-                user_cancelled,
-                tx,
-            )
-        }
+        InstallerKind::Inno => inno::extract_gui(input_file, output_dir, force, running, tx),
+        InstallerKind::MojoSetup => mojo::extract_gui(
+            &mmap,
+            input_file,
+            output_dir,
+            force,
+            running,
+            user_cancelled,
+            tx,
+        ),
     }
 }
 
