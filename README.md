@@ -5,6 +5,7 @@ gogextract.py rewrite in Rust with enhancements
 - File decompression
 - Multithread performance
 - Optinal GUI or CLI only builds
+- Can use innoextract for Windows installers if installed 
 <br>
 A few notable differences in operation
 
