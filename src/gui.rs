@@ -57,6 +57,74 @@ enum State {
     Cancelled,
 }
 
+/// Theme-derived colors, cached per-frame to avoid recomputing on every repaint.
+/// Rebuilt only when `is_dark` flips (i.e. the user switches the OS theme).
+struct ThemeColors {
+    is_dark: bool,
+    success: Color32,
+    danger: Color32,
+    warn: Color32,
+    log_text_default: Color32,
+    canvas_bg: Color32,
+    border: Color32,
+    mojo_kind: Color32,
+    inno_kind: Color32,
+    unknown_kind: Color32,
+}
+
+impl ThemeColors {
+    fn build(ctx: &egui::Context) -> Self {
+        let is_dark = ctx.style().visuals.dark_mode;
+        Self {
+            is_dark,
+            success: if is_dark {
+                Color32::from_rgb(158, 206, 106)
+            } else {
+                Color32::from_rgb(72, 94, 28)
+            },
+            danger: if is_dark {
+                Color32::from_rgb(247, 118, 142)
+            } else {
+                Color32::from_rgb(140, 43, 62)
+            },
+            warn: if is_dark {
+                Color32::from_rgb(224, 175, 104)
+            } else {
+                Color32::from_rgb(143, 91, 0)
+            },
+            log_text_default: if is_dark {
+                Color32::from_gray(210)
+            } else {
+                Color32::from_rgb(52, 53, 64)
+            },
+            canvas_bg: ctx.style().visuals.extreme_bg_color,
+            border: ctx.style().visuals.widgets.noninteractive.bg_stroke.color,
+            mojo_kind: if is_dark {
+                Color32::from_rgb(189, 147, 249)
+            } else {
+                Color32::from_rgb(52, 90, 182)
+            },
+            inno_kind: if is_dark {
+                Color32::from_rgb(139, 233, 253)
+            } else {
+                Color32::from_rgb(181, 137, 0)
+            },
+            unknown_kind: if is_dark {
+                Color32::from_gray(140)
+            } else {
+                Color32::from_gray(100)
+            },
+        }
+    }
+
+    /// Rebuild only when the dark-mode flag has changed.
+    fn refresh(&mut self, ctx: &egui::Context) {
+        if ctx.style().visuals.dark_mode != self.is_dark {
+            *self = Self::build(ctx);
+        }
+    }
+}
+
 pub struct App {
     state: State,
     installer_path_str: String,
@@ -81,11 +149,14 @@ pub struct App {
     tx: mpsc::Sender<GuiEvent>,
     running_flag: Arc<AtomicBool>,
     cancelled_flag: Arc<AtomicBool>,
+
+    /// Cached theme colors — rebuilt only when the dark/light mode flips.
+    theme: ThemeColors,
 }
 
 impl App {
     /// Creates a state container.
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = mpsc::channel();
 
         Self {
@@ -105,6 +176,7 @@ impl App {
             tx,
             running_flag: Arc::new(AtomicBool::new(false)),
             cancelled_flag: Arc::new(AtomicBool::new(false)),
+            theme: ThemeColors::build(&cc.egui_ctx),
         }
     }
 
@@ -112,23 +184,18 @@ impl App {
         let mut repainted = false;
 
         while let Ok(event) = self.rx.try_recv() {
-            // GuiEvent::Detected is emitted by the background detection thread
-            // and must be processed in any state so the installer profile label
-            // updates as soon as a file is loaded, before extraction starts.
-            if let GuiEvent::Detected(kind) = event {
-                self.detected_kind = Some(kind);
-                repainted = true;
-                continue;
-            }
-
-            // All other events are only meaningful while a worker is active.
-            if self.state != State::Running && self.state != State::Cancelling {
-                continue;
-            }
-
             repainted = true;
             match event {
-                GuiEvent::Detected(_) => unreachable!("handled above"),
+                // GuiEvent::Detected is emitted by the background detection thread
+                // and must be processed in any state so the installer profile label
+                // updates as soon as a file is loaded, before extraction starts.
+                GuiEvent::Detected(kind) => {
+                    self.detected_kind = Some(kind);
+                }
+
+                // All other events are only meaningful while a worker is active.
+                _ if self.state != State::Running && self.state != State::Cancelling => {}
+
                 GuiEvent::Progress {
                     files_done,
                     files_total,
@@ -298,16 +365,14 @@ impl App {
             return;
         }
 
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if let Some(first) = dropped.into_iter().next() {
-            if let Some(path) = first.path {
-                self.output_dir_str = crate::default_output_dir(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                self.installer_path_str = path.to_string_lossy().into_owned();
+        let first_path = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
+        if let Some(path) = first_path {
+            self.output_dir_str = crate::default_output_dir(&path)
+                .to_string_lossy()
+                .into_owned();
+            self.installer_path_str = path.to_string_lossy().into_owned();
 
-                self.detect_installer_async(ctx);
-            }
+            self.detect_installer_async(ctx);
         }
     }
 
@@ -357,32 +422,20 @@ impl eframe::App for App {
         self.handle_dropped_files(ctx);
         self.drain_events(ctx);
 
-        // Derive color standards by matching the active egui-configured system context
-        let is_dark = ctx.style().visuals.dark_mode;
-
-        let success_col = if is_dark {
-            Color32::from_rgb(158, 206, 106)
-        } else {
-            Color32::from_rgb(72, 94, 28)
-        };
-        let danger_col = if is_dark {
-            Color32::from_rgb(247, 118, 142)
-        } else {
-            Color32::from_rgb(140, 43, 62)
-        };
-        let warn_col = if is_dark {
-            Color32::from_rgb(224, 175, 104)
-        } else {
-            Color32::from_rgb(143, 91, 0)
-        };
-        let log_text_default = if is_dark {
-            Color32::from_gray(210)
-        } else {
-            Color32::from_rgb(52, 53, 64)
-        };
-
-        let canvas_bg = ctx.style().visuals.extreme_bg_color;
-        let border_color = ctx.style().visuals.widgets.noninteractive.bg_stroke.color;
+        // Rebuild theme colors only when dark/light mode has flipped, then copy
+        // all Color32 values into plain locals. Color32 is Copy, so this is
+        // zero-cost and avoids holding a borrow of `self.theme` across the
+        // `CentralPanel::show` closure (which also needs `&mut self`).
+        self.theme.refresh(ctx);
+        let success_col = self.theme.success;
+        let danger_col = self.theme.danger;
+        let warn_col = self.theme.warn;
+        let log_text_default = self.theme.log_text_default;
+        let canvas_bg = self.theme.canvas_bg;
+        let border_color = self.theme.border;
+        let mojo_kind_col = self.theme.mojo_kind;
+        let inno_kind_col = self.theme.inno_kind;
+        let unknown_kind_col = self.theme.unknown_kind;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
@@ -503,12 +556,12 @@ impl eframe::App for App {
                 }
 
                 if self.state == State::Done {
-                    if let Some(dir) = self.last_output_dir.clone() {
+                    if let Some(ref dir) = self.last_output_dir {
                         if ui
                             .button(RichText::new("📂 Open Output Folder").size(14.0))
                             .clicked()
                         {
-                            Self::open_folder(&dir);
+                            Self::open_folder(dir);
                         }
                     }
                 }
@@ -516,30 +569,9 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Color and label derived from typed InstallerKind — no string matching.
                     let (kind_label, kind_color) = match self.detected_kind {
-                        Some(InstallerKind::MojoSetup) => (
-                            "MojoSetup",
-                            if is_dark {
-                                Color32::from_rgb(189, 147, 249)
-                            } else {
-                                Color32::from_rgb(52, 90, 182)
-                            },
-                        ),
-                        Some(InstallerKind::Inno) => (
-                            "Inno Setup",
-                            if is_dark {
-                                Color32::from_rgb(139, 233, 253)
-                            } else {
-                                Color32::from_rgb(181, 137, 0)
-                            },
-                        ),
-                        None => (
-                            "Unknown",
-                            if is_dark {
-                                Color32::from_gray(140)
-                            } else {
-                                Color32::from_gray(100)
-                            },
-                        ),
+                        Some(InstallerKind::MojoSetup) => ("MojoSetup", mojo_kind_col),
+                        Some(InstallerKind::Inno) => ("Inno Setup", inno_kind_col),
+                        None => ("Unknown", unknown_kind_col),
                     };
 
                     ui.label(
