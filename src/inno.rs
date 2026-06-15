@@ -33,7 +33,10 @@ impl NoConsoleWindow for std::process::Command {
 use crate::mojo::ensure_output_path_available;
 
 pub fn list_lines(input_file: &std::path::Path) -> Result<Vec<String>> {
-    probe_innoextract()?;
+    // NOTE: list_lines deliberately does NOT call probe_innoextract() itself.
+    // All callers (list, extract, extract_gui) already call probe_innoextract()
+    // before reaching here. Adding a probe here would cause a redundant
+    // subprocess launch for callers that go list_lines → extract path.
     let output = std::process::Command::new("innoextract")
         .arg("--list")
         .arg(input_file)
@@ -218,7 +221,16 @@ pub fn extract(
         // On Windows, Ctrl-C causes innoextract to exit with STATUS_CONTROL_C_EXIT
         // (0xC000013A = -1073741510) before our kill() even fires.
         let code = status.code().unwrap_or(0) as i32;
-        if code == -1073741510i32 || !running.load(Ordering::Relaxed) {
+        #[cfg(windows)]
+        if code == STATUS_CONTROL_C_EXIT || !running.load(Ordering::Relaxed) {
+            pb.abandon_with_message("cancelled");
+            if resolved_output_dir.exists() {
+                let _ = fs::remove_dir_all(&resolved_output_dir);
+            }
+            return Ok(false);
+        }
+        #[cfg(not(windows))]
+        if !running.load(Ordering::Relaxed) {
             pb.abandon_with_message("cancelled");
             if resolved_output_dir.exists() {
                 let _ = fs::remove_dir_all(&resolved_output_dir);
@@ -242,6 +254,12 @@ pub fn extract(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Windows NTSTATUS code delivered when the process receives Ctrl-C
+/// (STATUS_CONTROL_C_EXIT = 0xC000013A). Rust represents it as a negative
+/// i32 because NTSTATUS values use the high bit to indicate severity.
+#[cfg(windows)]
+const STATUS_CONTROL_C_EXIT: i32 = -1073741510;
 
 fn probe_innoextract() -> Result<()> {
     let ok = std::process::Command::new("innoextract")
@@ -401,7 +419,15 @@ pub fn extract_gui(
     let status = child.wait().context("Failed to wait for innoextract")?;
     if !status.success() {
         let code = status.code().unwrap_or(0) as i32;
-        if code == -1073741510i32 || !running.load(Ordering::Relaxed) {
+        #[cfg(windows)]
+        if code == STATUS_CONTROL_C_EXIT || !running.load(Ordering::Relaxed) {
+            if resolved_output_dir.exists() {
+                let _ = fs::remove_dir_all(&resolved_output_dir);
+            }
+            return Ok(false);
+        }
+        #[cfg(not(windows))]
+        if !running.load(Ordering::Relaxed) {
             if resolved_output_dir.exists() {
                 let _ = fs::remove_dir_all(&resolved_output_dir);
             }
