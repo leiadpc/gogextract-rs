@@ -51,11 +51,17 @@ pub fn default_output_dir(input: &Path) -> PathBuf {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    base.join(
-        input
-            .file_stem()
-            .unwrap_or(OsStr::new("extracted_game_data")),
-    )
+    let stem = input.file_stem().unwrap_or_else(|| {
+        // Files without a stem (e.g. hidden files starting with '.') are rare;
+        // warn so the caller has a chance to notice the generic fallback name.
+        eprintln!(
+            "Warning: could not determine a file stem for '{}'; \
+             using 'extracted_game_data' as the output directory name.",
+            input.display()
+        );
+        OsStr::new("extracted_game_data")
+    });
+    base.join(stem)
 }
 
 // ---------------------------------------------------------------------------
