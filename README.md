@@ -4,7 +4,7 @@ gogextract.py rewrite in Rust with enhancements
 - Progress bar
 - File decompression
 - Multithread performance
-- Optinal GUI or CLI only builds
+- Optinal GUI or CLI only builds (use `cargo build --no-default-features` for CLI only build)
 - Can use innoextract for Windows installers if installed 
 <br>
 A few notable differences in operation
