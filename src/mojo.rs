@@ -404,33 +404,47 @@ fn scan_zip_counts(mmap: &ArcMmap) -> Result<ZipCounts> {
 }
 
 // ---------------------------------------------------------------------------
-// CLI extraction
+// Progress sink abstraction
+//
+// The CLI and GUI extraction paths are identical in every respect except how
+// progress is reported and how the final outcome is surfaced to the user
+// (a console ProgressBar vs an mpsc channel of GuiEvents). `extract_zip_inner`
+// drives the actual rayon extraction loop once; `extract` and `extract_gui`
+// are thin wrappers that build the appropriate ProgressSink impl and forward
+// to it.
 // ---------------------------------------------------------------------------
 
-pub fn extract(
+/// Receives progress notifications from the extraction loop. Implementations
+/// own their own display/transport (a console ProgressBar, an mpsc channel,
+/// etc.) and are called from worker threads, so methods take `&self`.
+trait ProgressSink: Sync {
+    /// A non-fatal warning, e.g. an unsafe path being skipped.
+    fn warn(&self, message: String);
+    /// A file has just been written, with the current running total. Called
+    /// on every file — implementations needing a low-frequency counter (e.g.
+    /// a progress bar position) can update unconditionally here.
+    fn file_written(&self, files_done: u64, files_total: u64);
+    /// Periodically called with the current file name, already throttled by
+    /// the caller so implementations can update a "now extracting" label
+    /// without flooding a console redraw or GUI channel.
+    fn current_file(&self, files_done: u64, files_total: u64, name: &str);
+}
+
+/// Drives the parallel ZIP extraction loop shared by the CLI and GUI paths.
+///
+/// Returns `Ok(true)` on success, `Ok(false)` if cancelled (with the staging
+/// dir cleaned up and `output_dir` left untouched), or `Err` on a real failure.
+fn extract_zip_inner(
     mmap: &ArcMmap,
-    input_file: &Path,
-    output_dir: Option<PathBuf>,
-    force: bool,
+    layout: &OutputLayout,
+    counts: &ZipCounts,
     running: &Arc<AtomicBool>,
     user_cancelled: &Arc<AtomicBool>,
+    sink: &dyn ProgressSink,
 ) -> Result<bool> {
-    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
-
-    let counts = scan_zip_counts(mmap)?;
-
-    let layout = prepare_output_layout(&resolved_output_dir, force)?;
-    let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
-
-    println!("Extracting to: {}\n", resolved_output_dir.display());
-    println!("Press Ctrl+C to cancel.\n");
-
-    let pb_files = ProgressBar::new(counts.file_count as u64);
-    pb_files.set_style(file_count_style());
-    pb_files.enable_steady_tick(Duration::from_millis(100));
-
     let extraction_start = Instant::now();
     let last_msg_nanos = Arc::new(AtomicU64::new(0));
+    let files_extracted = Arc::new(AtomicU64::new(0));
 
     let thread_count = rayon::current_num_threads();
     let min_chunk_size = (counts.entry_count / thread_count).max(1);
@@ -459,169 +473,9 @@ pub fn extract(
                 let entry_name = zip_file.name().to_owned();
                 let Some(path) = zip_file.enclosed_name() else {
                     // Skip entries with unsafe paths (e.g. path traversal) without
-                    // incrementing the progress bar — the file count total was
-                    // computed from safe entries only.
-                    eprintln!("Warning: skipping unsafe path in ZIP: {entry_name:?}");
-                    return Ok(());
-                };
-                // Write directly into the staging dir — no game_data subfolder.
-                let outpath = layout.staging_dir.join(&path);
-
-                if zip_file.is_dir() {
-                    fs::create_dir_all(&outpath).with_context(|| {
-                        format!("Failed to create directory {}", outpath.display())
-                    })?;
-                } else {
-                    if let Some(parent) = outpath.parent() {
-                        fs::create_dir_all(parent).with_context(|| {
-                            format!("Failed to create parent directory {}", parent.display())
-                        })?;
-                    }
-
-                    let outfile = File::create(&outpath)
-                        .with_context(|| format!("Failed to create {}", outpath.display()))?;
-
-                    let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, outfile);
-                    let mut reader = CancellableReader::new(&mut zip_file, running);
-
-                    let _written = io::copy(&mut reader, &mut writer)
-                        .with_context(|| format!("Failed to write {entry_name}"))?;
-
-                    writer
-                        .flush()
-                        .with_context(|| format!("Failed to flush {}", outpath.display()))?;
-
-                    #[cfg(unix)]
-                    if let Some(mode) = zip_file.unix_mode() {
-                        fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))
-                            .with_context(|| {
-                                format!("Failed to set permissions on {}", outpath.display())
-                            })?;
-                    }
-
-                    // Fetch clock metadata after I/O to minimise atomic contention.
-                    let now_ns = extraction_start.elapsed().as_nanos() as u64;
-                    let interval_ns = PROGRESS_MSG_INTERVAL.as_nanos() as u64;
-                    let last_ns = last_msg_nanos.load(Ordering::Relaxed);
-                    if now_ns.saturating_sub(last_ns) >= interval_ns
-                        && last_msg_nanos
-                            .compare_exchange(last_ns, now_ns, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            pb_files.set_message(name.to_owned());
-                        }
-                    }
-
-                    pb_files.inc(1);
-                }
-
-                Ok(())
-            },
-        );
-
-    // Single consolidated cancellation check — no duplicate block needed after
-    // this match because the Cancelled arm already returns early.
-    match extract_result {
-        Ok(()) => {}
-        Err(e)
-            if e.downcast_ref::<Cancelled>().is_some()
-                || user_cancelled.load(Ordering::Relaxed) =>
-        {
-            pb_files.abandon_with_message("cancelled");
-            drop(staging_cleanup);
-            // The output_dir was never populated (finalize_output was never
-            // called), so it is safe to remove if it exists. It may exist if
-            // prepare_output_layout created the parent but not the output dir
-            // itself — which it doesn't — so this is a no-op in the normal
-            // case. We still attempt removal defensively.
-            let _ = fs::remove_dir_all(&resolved_output_dir);
-            return Ok(false);
-        }
-        Err(e) => return Err(e),
-    }
-
-    pb_files.finish_with_message("done");
-
-    finalize_output(&layout)?;
-    staging_cleanup.disarm();
-
-    let elapsed = extraction_start.elapsed();
-    println!(
-        "\n  {} files  in {:.1}s",
-        counts.file_count,
-        elapsed.as_secs_f64()
-    );
-
-    Ok(true)
-}
-
-// ---------------------------------------------------------------------------
-// GUI extraction path
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "gui")]
-use crate::gui::GuiEvent;
-#[cfg(feature = "gui")]
-use std::sync::mpsc;
-
-#[cfg(feature = "gui")]
-pub fn extract_gui(
-    mmap: &ArcMmap,
-    input_file: &Path,
-    output_dir: Option<PathBuf>,
-    force: bool,
-    running: &Arc<AtomicBool>,
-    user_cancelled: &Arc<AtomicBool>,
-    tx: &mpsc::Sender<GuiEvent>,
-) -> Result<bool> {
-    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
-
-    let counts = scan_zip_counts(mmap)?;
-
-    let layout = prepare_output_layout(&resolved_output_dir, force)?;
-    let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
-
-    let _ = tx.send(GuiEvent::Log(format!(
-        "Extracting to: {}",
-        resolved_output_dir.display()
-    )));
-
-    let extraction_start = Instant::now();
-    let last_msg_nanos = Arc::new(AtomicU64::new(0));
-    let files_extracted = Arc::new(AtomicU64::new(0));
-
-    let tx = Arc::new(tx.clone());
-
-    let thread_count = rayon::current_num_threads();
-    let min_chunk_size = (counts.entry_count / thread_count).max(1);
-
-    let extract_result = (0..counts.entry_count)
-        .into_par_iter()
-        .with_min_len(min_chunk_size)
-        .try_for_each_init(
-            || {
-                let cursor = std::io::Cursor::new(mmap.clone());
-                zip::ZipArchive::new(cursor).context("Failed to open ZIP archive for worker")
-            },
-            |local_archive, i| -> Result<()> {
-                if !running.load(Ordering::Relaxed) {
-                    return Err(anyhow::anyhow!(Cancelled));
-                }
-
-                let local_archive = local_archive
-                    .as_mut()
-                    .map_err(|e| anyhow::anyhow!("ZIP archive init failed: {e:#}"))?;
-
-                let mut zip_file = local_archive
-                    .by_index(i)
-                    .with_context(|| format!("Failed to read ZIP entry #{i}"))?;
-
-                let entry_name = zip_file.name().to_owned();
-                let Some(path) = zip_file.enclosed_name() else {
-                    let _ = tx.send(GuiEvent::Log(format!(
-                        "Skipping unsafe path: {entry_name:?}"
-                    )));
+                    // incrementing progress — the file count total was computed
+                    // from safe entries only.
+                    sink.warn(format!("Skipping unsafe path in ZIP: {entry_name:?}"));
                     return Ok(());
                 };
                 // Write directly into the staging dir — no game_data subfolder.
@@ -660,8 +514,11 @@ pub fn extract_gui(
                     }
 
                     let fd = files_extracted.fetch_add(1, Ordering::Relaxed) + 1;
+                    sink.file_written(fd, counts.file_count as u64);
 
-                    // UI event throttling to prevent channel congestion.
+                    // Fetch clock metadata after I/O to minimise atomic contention,
+                    // and throttle how often we update the displayed filename so
+                    // fast extractions don't flood a console redraw / GUI channel.
                     let now_ns = extraction_start.elapsed().as_nanos() as u64;
                     let interval_ns = PROGRESS_MSG_INTERVAL.as_nanos() as u64;
                     let last_ns = last_msg_nanos.load(Ordering::Relaxed);
@@ -670,15 +527,9 @@ pub fn extract_gui(
                             .compare_exchange(last_ns, now_ns, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
                     {
-                        // Emit filename + progress atomically in one event so the
-                        // GUI fields never become out of sync.
-                        let current_file =
-                            path.file_name().and_then(|n| n.to_str()).map(str::to_owned);
-                        let _ = tx.send(GuiEvent::Progress {
-                            files_done: fd,
-                            files_total: counts.file_count as u64,
-                            current_file,
-                        });
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            sink.current_file(fd, counts.file_count as u64, name);
+                        }
                     }
                 }
 
@@ -686,22 +537,172 @@ pub fn extract_gui(
             },
         );
 
-    // Single consolidated cancellation check.
+    // Single consolidated cancellation check, covering both the in-loop
+    // Cancelled sentinel and the out-of-band user_cancelled flag (set e.g.
+    // by Ctrl+C handling, which may race ahead of the loop noticing `running`).
     match extract_result {
         Ok(()) => {}
         Err(e)
             if e.downcast_ref::<Cancelled>().is_some()
                 || user_cancelled.load(Ordering::Relaxed) =>
         {
-            // Drop the RAII guard first to clean up the staging dir.
-            // output_dir was never finalized so it is safe to remove if it
-            // exists. Because prepare_output_layout no longer creates
-            // output_dir itself, this is a no-op in the normal case.
-            drop(staging_cleanup);
-            let _ = fs::remove_dir_all(&resolved_output_dir);
+            // The output_dir was never populated (finalize_output was never
+            // called), so it is safe to remove if it exists. It may exist if
+            // prepare_output_layout created the parent but not the output dir
+            // itself — which it doesn't — so this is a no-op in the normal
+            // case. We still attempt removal defensively.
+            let _ = fs::remove_dir_all(&layout.output_dir);
             return Ok(false);
         }
         Err(e) => return Err(e),
+    }
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// CLI extraction
+// ---------------------------------------------------------------------------
+
+/// `ProgressSink` impl backed by an indicatif console progress bar.
+struct CliSink {
+    pb: ProgressBar,
+}
+
+impl ProgressSink for CliSink {
+    fn warn(&self, message: String) {
+        self.pb.println(format!("Warning: {message}"));
+    }
+
+    fn file_written(&self, files_done: u64, _files_total: u64) {
+        self.pb.set_position(files_done);
+    }
+
+    fn current_file(&self, _files_done: u64, _files_total: u64, name: &str) {
+        self.pb.set_message(name.to_owned());
+    }
+}
+
+pub fn extract(
+    mmap: &ArcMmap,
+    input_file: &Path,
+    output_dir: Option<PathBuf>,
+    force: bool,
+    running: &Arc<AtomicBool>,
+    user_cancelled: &Arc<AtomicBool>,
+) -> Result<bool> {
+    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
+
+    let counts = scan_zip_counts(mmap)?;
+
+    let layout = prepare_output_layout(&resolved_output_dir, force)?;
+    let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
+
+    println!("Extracting to: {}\n", resolved_output_dir.display());
+    println!("Press Ctrl+C to cancel.\n");
+
+    let pb = ProgressBar::new(counts.file_count as u64);
+    pb.set_style(file_count_style());
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    let extraction_start = Instant::now();
+    let sink = CliSink { pb: pb.clone() };
+
+    let ok = extract_zip_inner(mmap, &layout, &counts, running, user_cancelled, &sink)?;
+
+    if !ok {
+        pb.abandon_with_message("cancelled");
+        drop(staging_cleanup);
+        return Ok(false);
+    }
+
+    pb.finish_with_message("done");
+
+    finalize_output(&layout)?;
+    staging_cleanup.disarm();
+
+    println!(
+        "\n  {} files  in {:.1}s",
+        counts.file_count,
+        extraction_start.elapsed().as_secs_f64()
+    );
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// GUI extraction path
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gui")]
+use crate::gui::GuiEvent;
+#[cfg(feature = "gui")]
+use std::sync::mpsc;
+
+/// `ProgressSink` impl backed by an `mpsc::Sender<GuiEvent>`.
+#[cfg(feature = "gui")]
+struct GuiSink {
+    tx: mpsc::Sender<GuiEvent>,
+}
+
+#[cfg(feature = "gui")]
+impl ProgressSink for GuiSink {
+    fn warn(&self, message: String) {
+        let _ = self
+            .tx
+            .send(GuiEvent::Log(format!("Skipping unsafe path: {message}")));
+    }
+
+    fn file_written(&self, _files_done: u64, _files_total: u64) {
+        // The GUI only needs the throttled `current_file` tick below — sending
+        // a Progress event on every single file would flood the channel.
+    }
+
+    fn current_file(&self, files_done: u64, files_total: u64, name: &str) {
+        // Emit filename + progress atomically in one event so the GUI fields
+        // never become out of sync.
+        let _ = self.tx.send(GuiEvent::Progress {
+            files_done,
+            files_total,
+            current_file: Some(name.to_owned()),
+        });
+    }
+}
+
+#[cfg(feature = "gui")]
+pub fn extract_gui(
+    mmap: &ArcMmap,
+    input_file: &Path,
+    output_dir: Option<PathBuf>,
+    force: bool,
+    running: &Arc<AtomicBool>,
+    user_cancelled: &Arc<AtomicBool>,
+    tx: &mpsc::Sender<GuiEvent>,
+) -> Result<bool> {
+    let resolved_output_dir = output_dir.unwrap_or_else(|| crate::default_output_dir(input_file));
+
+    let counts = scan_zip_counts(mmap)?;
+
+    let layout = prepare_output_layout(&resolved_output_dir, force)?;
+    let mut staging_cleanup = StagingCleanup::new(&layout.staging_dir);
+
+    let _ = tx.send(GuiEvent::Log(format!(
+        "Extracting to: {}",
+        resolved_output_dir.display()
+    )));
+
+    let extraction_start = Instant::now();
+    let sink = GuiSink { tx: tx.clone() };
+
+    let ok = extract_zip_inner(mmap, &layout, &counts, running, user_cancelled, &sink)?;
+
+    if !ok {
+        // Drop the RAII guard first to clean up the staging dir.
+        // output_dir was never finalized so it is safe to remove if it
+        // exists. Because prepare_output_layout no longer creates
+        // output_dir itself, this is a no-op in the normal case.
+        drop(staging_cleanup);
+        return Ok(false);
     }
 
     // Send a final progress tick to ensure the GUI reaches 100%.
