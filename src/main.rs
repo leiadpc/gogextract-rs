@@ -4,6 +4,7 @@
 mod gui;
 mod inno;
 mod mojo;
+mod pkg;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -72,6 +73,7 @@ pub fn default_output_dir(input: &Path) -> PathBuf {
 pub enum InstallerKind {
     Inno,
     MojoSetup,
+    Pkg,
 }
 
 impl std::fmt::Display for InstallerKind {
@@ -79,6 +81,7 @@ impl std::fmt::Display for InstallerKind {
         match self {
             InstallerKind::Inno => write!(f, "Inno Setup"),
             InstallerKind::MojoSetup => write!(f, "MojoSetup"),
+            InstallerKind::Pkg => write!(f, "macOS Installer (.pkg)"),
         }
     }
 }
@@ -86,7 +89,15 @@ impl std::fmt::Display for InstallerKind {
 pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
     let data = mmap.as_ref();
 
-    // 1. Check for Inno Setup Windows installer signatures.
+    // 1. Check for XAR archives (macOS .pkg installers). XAR's magic is fixed
+    //    at offset 0 ("xar!"), so this is an O(1) check — cheapest test, so it
+    //    goes first.
+    const XAR_MAGIC: &[u8] = b"xar!";
+    if data.starts_with(XAR_MAGIC) {
+        return Ok(InstallerKind::Pkg);
+    }
+
+    // 2. Check for Inno Setup Windows installer signatures.
     //    Inno data is appended after the PE stub and can sit beyond 1 MiB on
     //    larger titles, so we scan up to 8 MiB (= INNO_SCAN_LIMIT).
     const INNO_MAGIC: &[u8] = b"Inno Setup Setup Data";
@@ -94,14 +105,14 @@ pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
     // known GOG releases without scanning the entire file.
     const INNO_SCAN_LIMIT: usize = 8 * 1024 * 1024;
     let scan_end = data.len().min(INNO_SCAN_LIMIT);
-    if data[..scan_end]
-        .windows(INNO_MAGIC.len())
-        .any(|w| w == INNO_MAGIC)
-    {
+    // memmem::find uses a Two-Way/SIMD-accelerated search instead of the naive
+    // O(n*m) windows().any() byte-by-byte comparison — meaningfully faster
+    // over an 8 MiB haystack, and this runs on every CLI invocation.
+    if memchr::memmem::find(&data[..scan_end], INNO_MAGIC).is_some() {
         return Ok(InstallerKind::Inno);
     }
 
-    // 2. Check for traditional ZIP archives or appended-script ZIP structures (.sh).
+    // 3. Check for traditional ZIP archives or appended-script ZIP structures (.sh).
     const EOCD_SIG: &[u8] = b"PK\x05\x06";
     // ZIP spec allows the EOCD record to appear anywhere in the last 65535+22
     // bytes of the file.
@@ -118,7 +129,7 @@ pub fn detect_installer_kind(mmap: &ArcMmap) -> Result<InstallerKind> {
 
     anyhow::bail!(
         "Unrecognised installer format — expected a MojoSetup installer \
-         (.sh/.exe) or an Inno Setup executable."
+         (.sh/.exe), an Inno Setup executable, or a macOS .pkg installer."
     );
 }
 
@@ -151,6 +162,15 @@ pub fn installer_worker_loop(
     match kind {
         InstallerKind::Inno => inno::extract_gui(input_file, output_dir, force, running, tx),
         InstallerKind::MojoSetup => mojo::extract_gui(
+            &mmap,
+            input_file,
+            output_dir,
+            force,
+            running,
+            user_cancelled,
+            tx,
+        ),
+        InstallerKind::Pkg => pkg::extract_gui(
             &mmap,
             input_file,
             output_dir,
@@ -247,6 +267,20 @@ fn run_cli(args: Args) -> Result<RunOutcome> {
                 mojo::list(&mmap).map(|()| true)
             } else {
                 mojo::extract(
+                    &mmap,
+                    &input_file,
+                    args.output_dir,
+                    args.force,
+                    &running,
+                    &user_cancelled,
+                )
+            }
+        }
+        InstallerKind::Pkg => {
+            if args.list {
+                pkg::list(&mmap).map(|()| true)
+            } else {
+                pkg::extract(
                     &mmap,
                     &input_file,
                     args.output_dir,
