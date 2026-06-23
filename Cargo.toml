@@ -9,6 +9,7 @@ clap = { version = "4.0", features = ["derive"] }
 ctrlc = "3.4"
 indicatif = "0.17"
 memmap2 = "0.9"
+memchr = "2.6.3"
 rayon = "1.10"
 zip = "2.0"
 flate2 = "1.1.9"
