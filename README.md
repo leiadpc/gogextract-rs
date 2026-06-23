@@ -1,11 +1,13 @@
 # GOGExtract-RS
+## This project is only focused on extracting GOG installer files, it may work for other installer files but is not supported
 gogextract.py rewrite in Rust with enhancements
 
 - Progress bar
 - File decompression
 - Multithread performance
 - Optinal GUI or CLI only builds (use `cargo build --no-default-features` for CLI only build)
-- Can use innoextract for Windows installers if installed 
+- Can extract MacOS pkg files
+- Can extract Windows installers with innoextract if installed 
 <br>
 A few notable differences in operation
 
