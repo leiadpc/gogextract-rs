@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use crate::InstallerKind;
 
@@ -57,6 +58,14 @@ enum State {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Success,
+    Error,
+    Warning,
+    Info,
+}
+
 /// Theme-derived colors, cached per-frame to avoid recomputing on every repaint.
 /// Rebuilt only when `is_dark` flips (i.e. the user switches the OS theme).
 struct ThemeColors {
@@ -69,6 +78,7 @@ struct ThemeColors {
     border: Color32,
     mojo_kind: Color32,
     inno_kind: Color32,
+    pkg_kind: Color32,
     unknown_kind: Color32,
 }
 
@@ -109,6 +119,11 @@ impl ThemeColors {
             } else {
                 Color32::from_rgb(181, 137, 0)
             },
+            pkg_kind: if is_dark {
+                Color32::from_rgb(158, 206, 106)
+            } else {
+                Color32::from_rgb(58, 132, 64)
+            },
             unknown_kind: if is_dark {
                 Color32::from_gray(140)
             } else {
@@ -142,13 +157,16 @@ pub struct App {
     files_total: u64,
     summary_text: String,
     error_text: String,
-    log: VecDeque<String>,
+    log: VecDeque<(LogLevel, String)>,
 
     // Multi-threading communication channels
     rx: mpsc::Receiver<GuiEvent>,
     tx: mpsc::Sender<GuiEvent>,
     running_flag: Arc<AtomicBool>,
     cancelled_flag: Arc<AtomicBool>,
+
+    // Render limits
+    last_repaint: Instant,
 
     /// Cached theme colors — rebuilt only when the dark/light mode flips.
     theme: ThemeColors,
@@ -176,8 +194,31 @@ impl App {
             tx,
             running_flag: Arc::new(AtomicBool::new(false)),
             cancelled_flag: Arc::new(AtomicBool::new(false)),
+            last_repaint: Instant::now(),
             theme: ThemeColors::build(&cc.egui_ctx),
         }
+    }
+
+    fn parse_log_level(line: &str) -> LogLevel {
+        if line.starts_with('✓') {
+            return LogLevel::Success;
+        }
+        if line.starts_with('✗') {
+            return LogLevel::Error;
+        }
+        if line.starts_with("⚠️") || line.starts_with('⚠') {
+            return LogLevel::Warning;
+        }
+
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("error") || lower.contains("failed") || lower.contains("abort") {
+            return LogLevel::Error;
+        }
+        if lower.contains("warning") || lower.contains("warn") || lower.contains("skipping") {
+            return LogLevel::Warning;
+        }
+
+        LogLevel::Info
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -211,7 +252,8 @@ impl App {
                     if self.log.len() >= MAX_LOG_LINES {
                         self.log.pop_front();
                     }
-                    self.log.push_back(line);
+                    let level = Self::parse_log_level(&line);
+                    self.log.push_back((level, line));
                 }
                 GuiEvent::Done {
                     elapsed_secs,
@@ -240,8 +282,16 @@ impl App {
             }
         }
 
+        // Throttle UI repaints driven by high-frequency background channel events
+        // down to roughly ~30 FPS (32 ms interval) to save CPU/GPU cycles.
         if repainted {
-            ctx.request_repaint();
+            let now = Instant::now();
+            if now.duration_since(self.last_repaint) >= Duration::from_millis(32) {
+                ctx.request_repaint();
+                self.last_repaint = now;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(32));
+            }
         }
     }
 
@@ -332,34 +382,6 @@ impl App {
         }
     }
 
-    fn log_line_color(
-        line: &str,
-        success: Color32,
-        danger: Color32,
-        warn: Color32,
-        default_text: Color32,
-    ) -> Color32 {
-        if line.starts_with('✓') {
-            return success;
-        }
-        if line.starts_with('✗') {
-            return danger;
-        }
-        if line.starts_with("⚠️") || line.starts_with('⚠') {
-            return warn;
-        }
-
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("error") || lower.contains("failed") || lower.contains("abort") {
-            return danger;
-        }
-        if lower.contains("warning") || lower.contains("warn") || lower.contains("skipping") {
-            return warn;
-        }
-
-        default_text
-    }
-
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         if self.state == State::Running || self.state == State::Cancelling {
             return;
@@ -412,7 +434,7 @@ impl App {
                 // without waiting for the next user interaction.
                 ctx.request_repaint();
             }
-            // On failure we leave detected_kind as None (unknown) — no event sent.
+            // On failure leave detected_kind as None (unknown) — no event sent.
         });
     }
 }
@@ -435,23 +457,11 @@ impl eframe::App for App {
         let border_color = self.theme.border;
         let mojo_kind_col = self.theme.mojo_kind;
         let inno_kind_col = self.theme.inno_kind;
+        let pkg_kind_col = self.theme.pkg_kind;
         let unknown_kind_col = self.theme.unknown_kind;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
-
-            if self.state == State::Idle && self.installer_path_str.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(
-                            "💡 Tip: drag and drop an installer file anywhere onto this window.",
-                        )
-                        .italics()
-                        .weak()
-                        .size(11.0),
-                    );
-                });
-            }
 
             ui.group(|ui| {
                 ui.set_width(ui.available_width());
@@ -462,11 +472,11 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         // --- ROW 1: Installer Entry ---
                         ui.label(RichText::new("Installer:").strong());
-                        if ui.button("📁 Browse...").clicked() {
+                        if ui.button("\u{1F5C0} Browse...").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter(
-                                    "Game Installers (*.exe, *.bin, *.sh)",
-                                    &["exe", "bin", "sh"],
+                                    "Game Installers (*.exe, *.sh, *.pkg)",
+                                    &["exe", "sh", "pkg"],
                                 )
                                 .pick_file()
                             {
@@ -483,7 +493,7 @@ impl eframe::App for App {
                         let edit_width = ui.available_width();
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.installer_path_str)
-                                .hint_text("/path/to/installer.sh")
+                                .hint_text("/path/to/installer.exe, .sh, or .pkg")
                                 .desired_width(edit_width),
                         );
 
@@ -505,12 +515,12 @@ impl eframe::App for App {
                         // --- ROW 2: Output Dir Entry ---
                         ui.label(RichText::new("Output Dir:").strong());
                         ui.horizontal(|ui| {
-                            if ui.button("📁 Browse...").clicked() {
+                            if ui.button("\u{1F5C0} Browse...").clicked() {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                     self.output_dir_str = path.to_string_lossy().into_owned();
                                 }
                             }
-                            if ui.button("↺ Reset").clicked() {
+                            if ui.button("\u{21BA} Reset").clicked() {
                                 if !self.installer_path_str.trim().is_empty() {
                                     let path = PathBuf::from(&self.installer_path_str);
                                     self.output_dir_str = crate::default_output_dir(&path)
@@ -541,13 +551,14 @@ impl eframe::App for App {
                 let can_extract = !self.installer_path_str.trim().is_empty()
                     && !self.running_flag.load(Ordering::Relaxed);
                 let btn_extract =
-                    egui::Button::new(RichText::new("🚀 Extract Game").strong().size(14.0));
+                    egui::Button::new(RichText::new("\u{1F4E4} Extract Game").strong().size(14.0));
 
                 if ui.add_enabled(can_extract, btn_extract).clicked() {
                     self.start_extraction(ctx);
                 }
 
-                let btn_cancel = egui::Button::new(RichText::new("🛑 Cancel").strong().size(14.0));
+                let btn_cancel =
+                    egui::Button::new(RichText::new("\u{274C} Cancel").strong().size(14.0));
                 if ui
                     .add_enabled(self.state == State::Running, btn_cancel)
                     .clicked()
@@ -558,7 +569,7 @@ impl eframe::App for App {
                 if self.state == State::Done {
                     if let Some(ref dir) = self.last_output_dir {
                         if ui
-                            .button(RichText::new("📂 Open Output Folder").size(14.0))
+                            .button(RichText::new("\u{1F5C1} Open Output Folder").size(14.0))
                             .clicked()
                         {
                             Self::open_folder(dir);
@@ -571,6 +582,7 @@ impl eframe::App for App {
                     let (kind_label, kind_color) = match self.detected_kind {
                         Some(InstallerKind::MojoSetup) => ("MojoSetup", mojo_kind_col),
                         Some(InstallerKind::Inno) => ("Inno Setup", inno_kind_col),
+                        Some(InstallerKind::Pkg) => ("pkg", pkg_kind_col),
                         None => ("Unknown", unknown_kind_col),
                     };
 
@@ -625,10 +637,13 @@ impl eframe::App for App {
                     ui.colored_label(danger_col, format!("✗ Error: {}", self.error_text));
                 }
                 State::Cancelling => {
-                    ui.colored_label(warn_col, "⏳ Cancelling — waiting for worker to stop...");
+                    ui.colored_label(
+                        warn_col,
+                        "\u{231B} Cancelling — waiting for worker to stop...",
+                    );
                 }
                 State::Cancelled => {
-                    ui.colored_label(warn_col, "🚨 Extraction was aborted and cleaned up.");
+                    ui.colored_label(warn_col, "Extraction was aborted and cleaned up.");
                 }
                 _ => {}
             }
@@ -641,22 +656,30 @@ impl eframe::App for App {
                 .stroke(Stroke::new(1.0, border_color))
                 .inner_margin(6.0)
                 .show(ui, |ui| {
+                    // Dynamically acquire the height of the custom text style to ensure accurate virtualization
+                    let row_height = ui.fonts(|f| f.row_height(&egui::FontId::monospace(11.0)));
+
                     egui::ScrollArea::vertical()
                         .id_salt("log")
                         .max_height(remaining_height)
                         .auto_shrink([false; 2])
                         .stick_to_bottom(true)
-                        .show(ui, |ui| {
+                        .show_rows(ui, row_height, self.log.len(), |ui, row_range| {
                             ui.set_width(ui.available_width());
-                            for line in &self.log {
-                                let color = Self::log_line_color(
-                                    line,
-                                    success_col,
-                                    danger_col,
-                                    warn_col,
-                                    log_text_default,
-                                );
-                                ui.label(RichText::new(line).monospace().size(11.0).color(color));
+
+                            // Iterate strictly over the visible subset of rows
+                            for row in row_range {
+                                if let Some((level, line)) = self.log.get(row) {
+                                    let color = match level {
+                                        LogLevel::Success => success_col,
+                                        LogLevel::Error => danger_col,
+                                        LogLevel::Warning => warn_col,
+                                        LogLevel::Info => log_text_default,
+                                    };
+                                    ui.label(
+                                        RichText::new(line).monospace().size(11.0).color(color),
+                                    );
+                                }
                             }
                         });
                 });
